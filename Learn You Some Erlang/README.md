@@ -14,6 +14,7 @@ Features
     - Declarative (concise, easier to read and maintain)
 - Concurrent
     - Actor Model (message passing)
+        - Every thread is only concerned with what its own sequential code
     - Thousands of concurrent processes
     - Supervision trees
 - High Availability
@@ -44,9 +45,24 @@ Common Shell Functions
 - `f(Variable).` erase variable
 - `cd(Path).` change the directory (by default, shell only looks for files in the directory it was started and in the standard library)
 - `c()`
-- `c(Module)`
+- `c(Module)` compile and load specified module
+- `rd(Name, Definition)` define a record
+- `rr("*")` load all records
+- `rr(Module)` load record definitions from specified module
+- `rl()` print all record definitions
+- `rl(Name)` print record definition of given name
+- `rf()` unload all records
+- `rf(Name)` unload specific definitions
+- `rp(Term)` convert tuple to record (given the definition exists)
+- `regs()` gets a list of all registered processes
 
 Use `erl -man` to get information about modules
+
+Information Tags
+
+- `[async-threads:N]` Number of threads in the async thread pool, which indirectly tells us how many system calls can be spun into background threads before emulator stalls
+- `[smp:X:Y]` X cores available, Y schedulers
+- More information can be found in the [SO thread](https://stackoverflow.com/questions/1182025/what-do-the-erlang-emulator-info-statements-mean)
 
 # Starting Out (for real)
 
@@ -342,6 +358,7 @@ Notable attributes
     - often the only imported functions are from the list module
 - `-compile([Flag1, Flag2]).`
 - `-vsn(VersionNumber).` specify a version value for hot-loading. If not specified, a unique value for the code (excluding comments) will be automatically generated
+- `-include("header.hrl")` include a header file
 
 Functions
 
@@ -881,7 +898,7 @@ read(N) ->
         {error, no_float} -> list_to_integer(N);
         {F, _} -> F
     end.
-
+string:
 rpn_test() ->
     5 = rpn("2 3 +"),
     87 = rpn("90 3 -"),
@@ -902,3 +919,884 @@ rpn_test() ->
 ```
 
 ## Heathrow to London
+
+![images/Untitled.png](images/Untitled.png)
+
+Find the Shortest Path
+
+```erlang
+-module(road).
+
+-compile(export_all).
+
+main([FileName]) ->
+    {ok, Bin} = file:read_file(FileName),
+    Map = parse_map(Bin),
+    io:format("~p~n", [optimal_path(Map)]),
+    erlang:halt(0).
+
+%% Transform a string into a readable map of triples
+parse_map(Bin) when is_binary(Bin) ->
+    parse_map(binary_to_list(Bin));
+parse_map(Str) when is_list(Str) ->
+    Values = [list_to_integer(X)
+              || X <- string:tokens(Str, "\r\n\t ")],
+    group_vals(Values, []).
+
+group_vals([], Acc) -> lists:reverse(Acc);
+group_vals([A, B, X | Rest], Acc) ->
+    group_vals(Rest, [{A, B, X} | Acc]).
+
+%% Picks the best of all paths, woo!
+optimal_path(Map) ->
+    {A, B} = lists:foldl(fun shortest_step/2,
+                         {{0, []}, {0, []}},
+                         Map),
+    {_Dist, Path} = if hd(element(2, A)) =/= {x, 0} -> A;
+                       hd(element(2, B)) =/= {x, 0} -> B
+                    end,
+    lists:reverse(Path).
+
+%% actual problem solving
+%% change triples of the form {A,B,X}
+%% where A,B,X are distances and a,b,x are possible paths
+%% to the form {DistanceSum, PathList}.
+shortest_step({A, B, X},
+              {{DistA, PathA}, {DistB, PathB}}) ->
+    OptA1 = {DistA + A, [{a, A} | PathA]},
+    OptA2 = {DistB + B + X, [{x, X}, {b, B} | PathB]},
+    OptB1 = {DistB + B, [{b, B} | PathB]},
+    OptB2 = {DistA + A + X, [{x, X}, {a, A} | PathA]},
+    {erlang:min(OptA1, OptA2), erlang:min(OptB1, OptB2)}.
+```
+
+The above code can be called from outside the Erlang shell, using the following commands:
+
+```bash
+$ erlc road.erl
+$ erl -noshell -run road main road.txt
+[{b,10},{x,30},{a,5},{x,20},{b,2},{b,8}]
+```
+
+# Common Data Structures
+
+## Records
+
+Records are an afterthought to the language and are syntactic sugar over tuples.
+
+As such, they have their share of inconveniences, but are still useful when you need a small data structure where you want to access attributes by name.
+
+```erlang
+-record(robot, {name,
+								type=industrial,
+								hobbies,
+								details=[]}).
+```
+
+Record attributes can have default values. If not set, Erlang sets the value to `undefined`.
+
+The `rr` command loads record definitions and makes them easier to work with in shell. 
+
+```erlang
+1> c(records).
+{ok,records}
+2> records:first_robot().
+{robot,"Mechatron",handmade,undefined,
+			["Moved by a small man inside"]}
+3> rr(records).
+[robot]
+4> records:first_robot().        
+#robot{name = "Mechatron",type = handmade,
+			hobbies = undefined,
+			details = ["Moved by a small man inside"]}
+```
+
+Other Relevant Shell Commands
+
+- `rd(Name, Definition)` define a record
+- `rr("*")` load all records
+- `rr(Module)` load record definitions from specified module
+- `rl()` print all record definitions
+- `rl(Name)` print record definition of given name
+- `rl([Names])` print record definitions of given names
+- `rf()` unload all records
+- `rf(Name)` unload a specific definition
+- `rf([Names])` unload specific definitions
+- `rp(Term)` convert tuple to record (given the definition exists)
+
+```erlang
+1> NestedBot = #robot{details=#robot{name="erNest"}}.
+#robot{name = undefined,type = industrial,
+			hobbies = undefined,
+			details = #robot{name = "erNest",type = industrial,
+			hobbies = undefined,details = []}}
+```
+
+- Access a record's attribute with syntax like so: `NestedBot#robot.type`
+- Access a nested record's attribute with syntax like so: `NestedBot#robot.details#robot.name`
+- To output which element of the underlying tuple an attribute is: `#robot.type` (returns 3)
+
+Records can be used in function heads to pattern match, and also in guards to filter for specific values or conditions.
+
+```erlang
+admin_panel(#user{name=Name, group=admin}) -> ...;
+admin_panel(#user{name=Name}) -> ....
+```
+
+```erlang
+adult_section(U = #user{}) when U#user.age >= 18 -> ...;
+adult_section(_) -> ....
+```
+
+Note that it's not necessary to match on all the parts of the record, or even know how many there are when writing the function. If you were to use a tuple instead of a record, you would have to specify the exact number of elements in the function head and update it if the tuple changes.
+
+You can update a record by reassigning its attributes. While it looks like we are modifying the record in place, a call is made to `erlang:setelement/3` which returns a new tuple.
+
+To share records across modules, Erlang makes use of *header files* (`.hrl`). Like their C counterpart, they are snippets of code that are added to the module as if it were written there when included with `-include()`.
+
+While some projects keep a project-wide .`hrl` file for records shared across all modules, it is probably a better idea to keep record definitions local and write functions to access its fields to keep details as private as possible. This helps prevent name clashes, avoids problems when upgrading code, and generally improves the readability/maintainability.
+
+## Key-Value Stores
+
+For small amounts of data:
+
+- proplists
+- orddicts
+
+For larger amounts of data:
+
+- dicts
+- gb trees
+
+### Proplists
+
+Any list of tuples of the form `[{Key, Value}]`.
+
+Use helper functions from the `proplists` module, e.g. `proplists:delete/2`, `proplists:get_value/2`, `proplists:get_all_values/2`, `proplists:lookup/2`.
+
+There is no function to add or update an element of the list - you must use cons manually and `lists:keyreplace`. This highlights how loosely defined proplists are as a data structure, and are more like a common pattern that appears (the `proplist` module being a toolbox over such a pattern)
+
+### Orddict
+
+Orddicts (ordered dictionaries) are proplists with a taste of formality
+
+- Keys must be unique
+- List is sorted for faster average lookup
+
+Use `orddict` module functions to perform CRUD e.g. `orddict:store/3`, `orddict:find/2` , `orddict:fetch/2` and `orddict:erase/2`.
+
+Orddicts are a generally good compromise between complexity and efficiency up to about 75 elements, after which it's probably wise to switch to another KV store
+
+### Dicts
+
+Dictionaries have the same interface as orddicts: `dict:store/3`, `dict:find/2`,`dict:fetch/2`, `dict:erase/2` etc. They are thus great options for scaling up from orddicts
+
+### GB Trees
+
+General Balanced Trees have a bunch more functions compared to orddicts/dicts, giving more control over how the structure is to be used
+
+Two modes:
+
+- "smart mode": where you know your structure in and out.
+    - Functions are `gb_trees:insert/3`, `gb_trees:get/2`, `gb_trees:update/3` and `gb_trees:delete/2`.
+    - Smart functions assume that key is present in the tree, skipping all safety checks.
+- "naive mode": you can't assume much about the DS.
+    - Functions are `gb_trees:enter/3`,`gb_trees:lookup/2` and `gb_trees:delete_any/2`.
+    - As gb trees are balanced trees, whenever you insert or delete elements it might cause the tree to rebalance itself. This takes time and memory (even for useless checks).
+
+    Wouldn't smart function insert or delete also cause the tree to rebalance itself? How is this a disadvantage unique to gb trees?
+
+gb trees vs dicts
+
+- gb trees have similar performance with dicts. Dicts generally have better read speeds while the gb trees tend to be a little quicker on other operations.
+- dicts have a fold function, gb_trees don't - they instead have an iterator function which returns a bit of the tree on which you can call the `gb_trees:next(Iterator)` to get the following values in order. You will need to write your own recursive function on top of gb trees rather than use a generic fold.
+- gb trees let you have quick access to the smallest and largest elements of a structure with `gb_trees:smallest/1` and `gb_trees:largest/1`
+
+Other than the above, there are also ETS tables, DETS tabls and mnesia databases. They will be covered later in detail.
+
+Starting from version 17.0, the language supports a new native key-value data type, the de-facto replacement for dicts. This is covered in the postscript. 
+
+## Arrays
+
+> Erlang arrays, at the opposite of their imperative counterparts, are not able to have such things as constant-time insertion or lookup. Because they're usually slower than those in languages which support destructive assignment and that the style of programming done with Erlang doesn't necessary lend itself too well to arrays and matrices, they are rarely used in practice.
+
+Generally, Erlang programmers who need to do matrix manipulations and other uses requiring arrays tend to use concepts called [Ports](http://erlang.org/doc/tutorial/c_port.html) to let other languages do the heavy lifting, or [C-Nodes](http://erlang.org/doc/apps/erl_interface/ei_users_guide.html), [Linked in drivers](http://erlang.org/doc/tutorial/c_portdriver.html) and [NIFs](https://erldocs.com/18.0/erts/erl_nif.html) (Experimental, R13B03+).
+
+Arrays are also weird in the sense that they're one of the few data structures to be 0-indexed (at the opposite of tuples or lists), along with indexing in the regular expressions module. Be careful with them.
+
+## Sets
+
+Types
+
+- ordsets
+- sets
+- gb sets
+- sofs
+
+### Ordsets
+
+Implemented as a sorted list.
+
+Mainly useful for small sets and are the slowest kind, but have the simplest and most readable representation.
+
+### Sets
+
+Sets (the module) is implemented on top of a structure similar to the one used in dict. 
+
+They implement the same interface as ordsets, but scale better.
+
+Like dictionaries, they're especially good for read-intensive manipulations.
+
+### GB Sets
+
+gb sets themselves are constructed above a General Balanced Tree structure similar to the one used in the `gb_trees` module. 
+
+gb sets are to sets what gb trees are to dicts - an implementation that is faster for non-read operations and leaves the programmer more control. Like gb trees, there are smart and naive functions, iterators, quick access to smallest and largest values.
+
+### Sofs
+
+Sets of sets (sofs) are implemented with sorted lists, inside a tuple with some metadata. They give full control over relationships between sets, families, enforce set types etc. 
+
+Because set theory is closely related to directed graphs, the `sofs` modules contains functions to convert family to digraphs and digraphs to families.
+
+While variety is great, some implementation details can be frustrating. For example, gb sets, orsets and sofs all use `==` to compare values, the `sets` module uses the `=:=` operator, which means you can't necessarily switch over every implementation.
+
+Björn Gustavsson, from the Erlang/OTP team [suggests](http://erlang.org/pipermail/erlang-questions/2010-March/050332.html) using gb sets in most circumstances, using ordset when you need a clear representation that you want to process with your own code and `sets` when you need the `=:=` operator.
+
+Always test and measure when deciding whether to use a data structure over another.
+
+## Directed Graphs
+
+Implemented in two modules:
+
+- `digraph`
+    - Allows the construction and modification of a directed graph: manipulating edges and vertices, finding paths and cycles etc.
+- `digraph_utils`
+    - Allows the navigation of graph (postorder, preorder), testing for cycles, arborescences of or trees, finding neighbours, and so on.
+
+**arborescence** a directed graph in which, for a vertex u called the root and any other vertex v, there is exactly one directed path from u to v.
+
+## Queues
+
+The `queue` module implements a double-ended FIFO queue.
+
+Implemented as two lists (stacks) that allow both appending and prepending elements rapidly.
+
+Seek more details about how the two lists are implemented.
+
+The queue module separates functions into 3 interfaces of varying complexity
+
+- Original API
+    - Contains functions at the base of the queue concept - `new/0` for creating empty queues, `in/2` for inserting new elements, `out/1` for removing elements.
+    - Also contains functions to convert to lists, reverse the queue, find a value in queue.
+- Extended API
+    - Adds introspection power and flexibility: look at front of the queue without removing the first element (`get/1` or `peek/1`), removing elements without caring about them (`drop/1`).
+- Okasaki API
+    - Derived from Chris Okasaki's [Purely Functional Data Structures](http://books.google.ca/books?id=SxPzSTcTalAC&lpg=PP1&dq=chris%20okasaki%20purely%20functional%20data%20structures&pg=PP1#v=onepage&q=&f=false), provides operations similar to what was available in the previous APIs.
+    - Unless you know you want this API, ignore it.
+
+Use queues when you need to ensure that the first item ordered is the first one processed. Thus far, we've used list as accumulators that would then be reversed. In cases where you can't do the reversing at once and elements are frequently added, use queues.
+
+# Hitchhiker's Guide to Concurrency
+
+**concurrency** refers to the idea of having many actors running independently, but not necessarily at the same time
+
+**parallelism** having actors running exactly at the same time
+
+Erlang had concurrency from the beginning, when everything was done on single core processors. Each Erlang process would have its own time slice to run, much like desktop applications did before multi-core systems. 
+
+To achieve parallelism back then, we needed a second computer running code and communicating with the first one. Nowadays, multi- core systems allow for parallelism on a single computer and Erlang takes advantage of that.
+
+There's a misconception that Erlang was ready for multi-core computers years before it actually was. True symmetric mulitprocessing (SMP) was only available in 2000s and prior, parallelism on multi-core computers was achieved by starting many instances of the VM.
+
+## Scalability
+
+As actors are processes which only reacted upon certain events, an ideal system would support processes doing small computations, switching between them as events came through.
+
+To make it efficient, it made sense for processes to be started, destroyed, and switched between very fast. This is achieved with lightweight processes.
+
+Additionally, lightweight processes also helped avoid having to set limits on the number of processes a program can start.
+
+It is also important to be able to bypass hardware limitations. You can do this by:
+
+- Making hardware better
+    - Only useful up until a certain point, after which it becomes extremely expensive (buying a supercomputer)
+- Adding more hardware
+    - Usually cheaper - distribution is thus useful to have as part of the language
+
+As applications need to be reliable, processes were forbidden from sharing memory, since that could leave things in an inconsistent state after crashes. Message passing risks being slower and thus being bad for scalability, but is safer.
+
+## Fault-Tolerance
+
+It is near impossible to prevent bugs, plus a bug-free program can still face hardware failures - thus it is a good idea to handle errors and problems rather than trying to prevent them all.
+
+Lightweight processes with quick restarts and shutdowns help errors  which cause corrupt data to quickly crash the faulty part of the system. This prevents errors and bad data from propagating to the rest of the system.
+
+There exist many ways for a system to terminate, two of which are clean shutdowns and crashes. The worse case is the crash, thus we can strive to make sure all crashes are the same as clean shutdowns, by:
+
+- sharing nothing
+- single assignment (which isolates a process' memory)
+- avoiding locks (could happen to not be unlocked during a crash)
+
+Error handling mechanisms are also crucial in helping processes monitor other processes to know when processes die and handle the event.
+
+To accommodate hardware failure, distribute your program over machines (needed for scaling anyway). Message passing and no-shared memory helps because the programs work the same way locally or on a different computer, making fault tolerance through distribution nearly transparent to the programmer.
+
+Note that you cannot assume that a node will be alive throughout the whole remote function call, or that it will execute correctly. With asynchronous message passing, messages sent from one process to another are stored in a mailbox inside the receiving process:
+
+- Messages are sent without checking if receiving process exists or not
+- It's impossible to know if a process will crash between the time a message is sent and received.
+- If received, it's impossible to know if it will be acted upon or if receiving process will die before that.
+
+Asynchronous messages allow safe remote function calls because there's no assumption about what will happen, the programmer implements confirmations by sending further messages.
+
+## Implementation
+
+OSes can't be trusted to handle the processes - they have different ways of handling processes and their performance varies a lot. Most of them are too slow or too heavy for what is needed in standard Erlang applications.
+
+Instead, Erlang handles processes in the VM and lets the language implementers keep control of optimization and reliability. 
+
+Erlang's processes take about 300 words of memory each and can be created in a manner of microseconds — not something doable on major operating systems these days.
+
+The VM starts one thread per core which acts as a *scheduler*. However, as of R15B, the runtime system does not bind schedulers to logical processors by default. This is because performance will be poor if the processors are performing work other than running BEAM.
+
+**scheduler** each scheduler has a *run queue.*
+
+**run queue** a list of Erlang processes on which to spend a slice of time. 
+
+When one of these schedulers has too many tasks in the run queue, some are migrated to another one. The Erlang VM thus takes care of load-balancing.
+
+The rate at which messages can be sent on overloaded processes is also limited in order to regulate and distribute the load.
+
+Inspect the shell information tags to gain insight on how many cores, schedulers and async threads BEAM is using. See [here](https://stackoverflow.com/questions/1182025/what-do-the-erlang-emulator-info-statements-mean).
+
+## Linear Scaling
+
+Performance doesn't linearly scale the number of cores/processors.
+
+Problems that scale well are said to be *embarrassingly parallel* (e.g. ray-tracing, brute-force searches)
+
+Erlang's embarrassingly parallel problems are at a higher level. Usually, they have to do with concepts such as chat servers, phone switches, web servers, message queues, web crawlers or other systems where work can be represented as independent logical entities (actors).
+
+Amdahl's law demonstrates that getting rid of the last few sequential parts of a program allows a relatively huge theoretical speedup compared to removing the same amount of sequential code tin a program that is not very parallel to begin with.
+
+When running purely sequential applications, hardware optimizations cause the VM to spend time doing useless stuff and run much slower on many cores than on a single one. You can disable symmetric multiprocessing (`$ erl +S 1`) in this case.
+
+## Concurrency Primitives
+
+Key Primitives
+
+- Spawning new processes
+- Sending messages
+- Receiving messages
+
+A process is a function with some hidden state (mailbox for messages).
+
+```erlang
+1> spawn(fun() -> 2 + 2 end).
+<0.44.0>
+```
+
+A process is created with `spawn/1`, and the result is a *Process Identifier* (PID)
+
+**process identifier** an arbitrary value representing any process that exists (or might have existed) at some point in the VM's life. It is used as the process' address for communication.
+
+`self/0` returns the pid of the current process
+
+`exit/1` kills a process
+
+You can also create a process with `spawn(Module, Function, [Arguments])`
+
+```erlang
+1> self() ! hello.
+hello
+2> self() ! self() ! double.
+double
+```
+
+A message is sent with the `!` symbol. 
+
+In the above, the message has been put in the process' mailbox, but it hasn't been read yet - the `hello` seen in the shell is the return value of the send operation.
+
+Messages in a mailbox are kept in the order they are received.
+
+`flush/0` outputs the contents of the current mailbox.
+
+```erlang
+receive
+	Pattern1 when Guard1 -> Expr1;
+	Pattern2 when Guard2 -> Expr2;
+	Pattern3 -> Expr3;
+end
+```
+
+Receive is syntactically similar to `case ... of` and works the same way, except they bind variables coming from messages.
+
+In order to send a reply, the sender must include their own PID with the message, i.e. `{Pid, Message}`.
+
+In order for the receiving process to "stay alive" after responding to a message, it should call itself in a tail position. This will not blow the stack even if the function loops indefinitely, thanks to tail recursion.
+
+# More on Multiprocessing
+
+Transient state can be maintained as parameters of the recursive receiving function.
+
+For a cleaner interface, use helper functions to abstract away the spawning of the fridge process, as well as the actual sending and receiving. This also allows us to modify the internals (e.g. add logging when fridge starts) without changing the interface.
+
+```erlang
+fridge2(FoodList) ->
+	receive
+		{From, {store, Food}} ->
+			From ! {self(), ok},
+			fridge2([Food|FoodList]);
+		{From, {take, Food}} ->
+			case lists:member(Food, FoodList) of
+				true ->
+					From ! {self(), {ok, Food}},
+					fridge2(lists:delete(Food, FoodList));
+				false ->
+					From ! {self(), not_found},
+					fridge2(FoodList)
+			end;
+		terminate ->
+			ok
+	end.
+
+store(Pid, Food) ->
+	Pid ! {self(), {store, Food}},
+	receive
+		{Pid, Msg} -> Msg
+	end.
+ 
+take(Pid, Food) ->
+	Pid ! {self(), {take, Food}},
+	receive
+		{Pid, Msg} -> Msg
+	end.
+
+start(FoodList) ->
+	spawn(?MODULE, fridge2, [FoodList]). % ?MODULE is a macro returning current module's name
+```
+
+## Timeout
+
+```erlang
+receive
+	Match -> Expression1
+after Delay ->
+	Expression2
+end.
+```
+
+`Delay` is an integer representing milliseconds. After that amount of time has been spent without receiving a message that matches the `Match` pattern, `Expression2` is executed.
+
+`Delay` can also be the atom `infinity` - while this is not useful in most cases since you can just remove the `after` clause, it is sometimes used when `Delay` is parameterised. The caller can submit `infinity` to wait forever.
+
+Other than giving up after too long, timeout can also be used to trigger events after a certain amount of time (think `timer:sleep/1`).
+
+```erlang
+flush() ->
+	receive
+		_ -> flush()
+	after 0 ->
+		ok
+	end.
+```
+
+`Delay` can also be set as `0` to serve as a "finally". In the above, `flush()` repeatedly calls itself every time there's a message in the mailbox, and executes `after` when the mailbox is empty.
+
+## Selective Receives
+
+Receive takes the first message that matches its available patterns, ignoring all messages that do not. 
+
+```erlang
+important() ->
+	receive
+		{Priority, Message} when Priority > 10 ->
+		[Message | important()]
+	after 0 ->
+		normal()
+	end.
+ 
+normal() ->
+	receive
+		{_, Message} ->
+			[Message | normal()]
+	after 0 ->
+		[]
+	end.
+```
+
+In the process of reading messages from the mailbox, Erlang puts messages that are seen but not matched into a *save queue*, which is then put back into the mailbox after a match is found (or not found). As there are more non-matched messages, the process of reading useful messages thus get slower.
+
+For example, the first 366 message in a mailbox are useless. They will always have to be taken and put into a save queue everytime a useful message is searched for.
+
+This is a frequent cause of performance problems in Erlang. If your application is slow and there are a lot of messages, this could be a cause.
+
+The aforementioned issue can be solved by:
+
+- Making sure every message will match at least one clause. A catch-all pattern can process the unexpected message.
+- If you need selective receives and can't implement a catch-all, implement a min-heap or use `gb_trees` to store messages. This will allow for quick searching by "priority".
+
+In R14A, an optimization was added to the compiler. By making a reference (`make_ref()`) and having selective receive look out for the reference, the compiler automatically makes sure the VM will skip messages received before the creation of that reference.
+
+# Errors and Processes
+
+## Links
+
+When a link is set up between two processes, if one of the processes dies from an unexpected throw, error or exit, the other linked process also dies.
+
+Links help processes fail as soon as possible to stop further errors. If a process crashes, links help us stop the other processes that depend on the crashed process.
+
+`link/1` takes a pid as an argument, creating a link between the current process and the one identified by the pid.
+
+Links cannot be stacked - linking 15 times for the same two processes will result in one link being established.
+
+`unlink/1` gets rid of a link between the current process and that identified by the supplied pid.
+
+```erlang
+1> link(spawn(fun() -> exit(reason) end)).
+** exception error: reason
+```
+
+When a linked process crashes, a special message is sent with information of what happened. 
+
+- This message is not sent on normal termination.
+- The exception message cannot be caught with a `try ... catch`.
+- It propagates from the source of the crash along the established links (furthest process receives signal last).
+
+Note that `link(spawn(Function))` happens in more than one step and its possible for a process to die before the link has been set up. `spawn_link/1-3` was added to address this, performing the steps as one atomic operation.
+
+## Traps
+
+Error propagation across processes is done similarly as message passing, but with a special type of message called *signals*. Exit signals kill processes.
+
+To achieve reliability, an application needs to be able to both kill and restart a process quickly. 
+
+System processes are normal processes that can convert exit signals to regular messages, and can thus detect when a process has died. They do this by calling `process_flag(trap_exit, true)` in a running process.
+
+```erlang
+1> process_flag(trap_exit, true).
+false
+2> spawn_link(fun() -> exit(reason) end).
+<0.49.0>
+3> receive X -> X end.
+{'EXIT',<0.49.0>, reason}
+```
+
+Trapped vs Untrapped Results
+
+- **Exception source: `spawn_link(fun() -> ok end)`**
+
+    **Untrapped Result**: - nothing -
+
+    **Trapped Result**: {'EXIT', <0.61.0>, normal}
+
+    The process exited normally, without a problem. Note that this looks a bit like the result of `catch exit(normal)`, except a PID is added to the tuple to know what processed failed.
+
+- **Exception source: `spawn_link(fun() -> exit(reason) end)`**
+
+    **Untrapped Result**: ** exception exit: reason
+
+    **Trapped Result**: {'EXIT', <0.55.0>, reason}
+
+    The process has terminated for a custom reason. In this case, if there is no trapped exit, the process crashes. Otherwise, you get the above message.
+
+- **Exception source: `spawn_link(fun() -> exit(normal) end)`**
+
+    **Untrapped Result**: - nothing -
+
+    **Trapped Result**: {'EXIT', <0.58.0>, normal}
+
+    This successfully emulates a process terminating normally. In some cases, you might want to kill a process as part of the normal flow of a program, without anything exceptional going on. This is the way to do it.
+
+- **Exception source: `spawn_link(fun() -> 1/0 end)`**
+
+    **Untrapped Result**: Error in process <0.44.0> with exit value: {badarith, [{erlang, '/', [1,0]}]}
+
+    **Trapped Result**: {'EXIT', <0.52.0>, {badarith, [{erlang, '/', [1,0]}]}}
+
+    The error (`{badarith, Reason}`) is never caught by a `try ... catch` block and bubbles up into an 'EXIT'. At this point, it behaves exactly the same as `exit(reason)` did, but with a stack trace giving more details about what happened.
+
+- **Exception source: `spawn_link(fun() -> erlang:error(reason) end)`**
+
+    **Untrapped Result**: Error in process <0.47.0> with exit value: {reason, [{erlang, apply, 2}]}
+
+    **Trapped Result**: {'EXIT', <0.74.0>, {reason, [{erlang, apply, 2}]}}
+
+    Same effect as `1/0` - `erlang:error/1` is intended to behave like that.
+
+- **Exception source: `spawn_link(fun() -> throw(rocks) end)`**
+
+    **Untrapped Result**: Error in process <0.51.0> with exit value: {{nocatch, rocks}, [{erlang, apply, 2}]}
+
+    **Trapped Result**: {'EXIT', <0.79.0>, {{nocatch, rocks}, [{erlang, apply, 2}]}}
+
+    Because the `throw` is never caught by a `try ... catch`, it bubbles up into an error, which in turn bubbles up into an EXIT. Without trapping exit, the process fails. Otherwise it deals with it fine.
+
+- **Exception source: `exit(self(), normal)`**
+
+    **Untrapped Result**: ** exception exit: normal
+
+    **Trapped Result**: {'EXIT', <0.31.0>, normal}
+
+    When not trapping exits, `exit(self(), normal)` acts the same as `exit(normal)`. Otherwise, you receive a message with the same format you would have had by listening to links from foreign processes dying.
+
+- **Exception source: `exit(spawn_link(fun() -> timer:sleep(50000) end), normal)`**
+
+    **Untrapped Result**: - nothing -
+
+    **Trapped Result**: - nothing -
+
+    This basically is a call to `exit(Pid, normal)`. This command doesn't do anything useful, because a process cannot be remotely killed with the reason `normal` as an argument.
+
+- **Exception source: `exit(spawn_link(fun() -> timer:sleep(50000) end), reason)`**
+
+    **Untrapped Result**: ** exception exit: reason
+
+    **Trapped Result**: {'EXIT', <0.52.0>, reason}
+
+    This is the foreign process terminating for reason itself. Looks the same as if the foreign process called `exit(reason)` on itself.
+
+- **Exception source: `exit(spawn_link(fun() -> timer:sleep(50000) end), kill)`**
+
+    **Untrapped Result**: ** exception exit: killed
+
+    **Trapped Result**: {'EXIT', <0.58.0>, killed}
+
+    The spawner now receives `killed` instead of `kill`. That's because `kill` is a special exit signal.
+
+- **Exception source: `exit(self(), reason)`**
+
+    **Untrapped Result**: ** exception exit: reason
+
+    **Trapped Result**: {'EXIT', <0.31.0>, reason}
+
+    System processes can trap exit called on the system process itself. Oddly, calling `exit(reason)` directly in a system process does result in a crash.
+
+- **Exception source: `exit(self(), kill)`**
+
+    **Untrapped Result**: ** exception exit: killed
+
+    **Trapped Result**: ** exception exit: killed
+
+    `kill` is a special signal that cannot be trapped, ensuring any process terminated with it will really be dead. It's a last resort (e.g. system process is stuck in an infinite loop). 
+
+    As the `kill` reason cannot be trapped, it needs to be changed to `killed` when other processes receive the message, else every other process linked will die.
+
+- **Exception source: `spawn_link(fun() -> exit(kill) end)`**
+
+    **Untrapped Result**: ** exception exit: killed
+
+    **Trapped Result**: {'EXIT', <0.67.0>, kill}
+
+    Exit can be trapped when it happens in a linked process.
+
+## Monitors
+
+Monitors are a special type of link with two differences:
+
+- they are unidirectional
+- they can be stacked
+
+Use monitors when a process needs to know what's going on in a second process, but neither of them is vital to each other.
+
+Links are more of an organizational construct - some processes will supervise others, some couldn't live without a twin process. Links are used to establish structure that is fixed and known in advance.
+
+Say you use X number of libraries in a process that all need to establish links with another process. If one of them unlinks with the other process, all of the links are removed - this is why stackable links are necessary.
+
+It might also be useful for the other process to be unaware of said libraries, thus unidirectional links are desirable.
+
+```erlang
+1> monitor(process, spawn(fun() -> timer:sleep(500) end)).
+#Ref<0.0.0.77>
+2> flush().
+Shell got {'DOWN',#Ref<0.0.0.77>,process,<0.63.0>,normal}
+ok
+```
+
+Every time a process being monitored goes down, a message `{'DOWN', MonitorReference, process, Pid, Reason}` is received. Since monitors are stackable, the reference allows the monitor-er to tear down the specific monitor.
+
+`monitor/2` takes the `process` atom and a pid, setting up a monitor from the current process on the processed identified by the pid.
+
+`demonitor/1` accepts a monitor reference and tears down the monitor.
+
+`demonitor/2` accepts a list of options as the second parameter.
+
+- `info` causes the function to return a boolean indicating whether a monitor existed when the function was called
+- `flush` removes the `DOWN` message from the mailbox if it existed
+
+As with links, there is an atomic `spawn_monitor/1-3`.
+
+## Naming Processes
+
+Naming a process replaces the unpredictable pid with an atom. The atom can be used exactly as a pid when sending messages.
+
+`register/2` gives a process the supplied name
+
+`unregister/1` removes the name from a process. Note that when a process dies, it automatically loses its name.
+
+`registered/0` gets a list of all registered processes.
+
+`whereis/1` takes an atom and returns a pid corresponding to a process named as that atom.
+
+```erlang
+restarter() ->
+	process_flag(trap_exit, true),
+	Pid = spawn_link(?MODULE, receiver, []),
+	register(receiver, Pid),
+	receive
+		{'EXIT', Pid, normal} -> % not a crash
+			ok;
+		{'EXIT', Pid, shutdown} -> % manual termination, not a crash
+			ok;
+		{'EXIT', Pid, _} ->
+	restarter()
+	end.
+
+sender(Message) ->
+	receiver ! {self(), {Message}},
+	Pid = whereis(receiver),
+	receive
+		{Pid, Response} -> Response
+	after 2000 ->
+		timeout
+	end.
+```
+
+When pattern matching against messages, you will need to use `whereis` to find the exact pid of the named process. 
+
+However, this introduces the implicit assumption that the named process' pid will remain the same between receiving the message, and the call to `whereis`. The process might have died in between the two steps and restarted, giving a different pid.
+
+This *race condition* is a result of sharing state across processes (the name of the process). Essentially, the name can be accessed/modified by different processes at the same time, causing inconsistent information and software errors.
+
+Despite what people might say, Erlang is not free of race conditions or deadlocks - parallel code is not automatically safe. Named processes are one of the ways parallel code can go wrong, others include file access, updating databases etc.
+
+To address the above issue, don't assume the name process remains the same. Use references (`make_ref()`) as unique values to identify messages.
+
+```erlang
+sender2(Message) ->
+	Ref = make_ref(),
+	critic ! {self(), Ref, Message},
+	receive
+		{Ref, Response} -> Response
+	after 2000 ->
+		timeout
+	end.
+```
+
+Named processes help processes continue to function even when a process that they depend on is restarted (and thus change pid). 
+
+However, atoms should never be created dynamically. Naming processes should be reserved for important services unique to an instance of a VM that stay alive for the entire lifetime of the application.
+If you need a transient named process or if its not unique to the VM, it is probably better represented as a group. Linking and restarting them together if they crash is a better option.
+
+# Designing a Concurrent Application
+
+This section will build a reminder app.
+
+## Specification
+
+- Add an event. Events contain a deadline (the time to warn at), an event name and a description.
+- Show a warning when the time has come for it.
+- Cancel an event by name.
+- No persistent disk storage. It's not needed to show the architectural concepts we'll see. It will suck for a real app, but I'll instead just show where it could be inserted if you wanted to do it and also point to a few helpful functions.
+- Given we have no persistent storage, we have to be able to update the code while it is running.
+- The interaction with the software will be done via the command line, which can be extended later.
+
+    ![images/Untitled1.png](images/Untitled1.png)
+
+Event Server
+
+- Accepts subscriptions from clients
+- Forwards notifications from event processes to each of the subscribers
+- Accepts messages to add events (and start the x, y, z processes needed)
+- Can accept messages to cancel an event and subsequently kill the event processes
+- Can be terminated by a client
+- Can have its code reloaded via the shell.
+
+Client
+
+- Subscribes to the event server and receive notifications as messages. As such it should be easy to design a bunch of clients all subscribing to the event server. Each of these could potentially be a gateway to different interaction points (GUI, web page, instant messaging software, email, etc.)
+- Asks the server to add an event with all its details
+- Asks the server to cancel an event
+- Monitors the server (to know if it goes down)
+- Shuts down the event server if needed
+
+Event (x, y, z)
+
+- Represent a notification waiting to fire (they're basically just timers linked to the event server)
+- Send a message to the event server when the time is up
+- Receive a cancellation message and die
+
+In a real-world application, using a process per event is overkill and will affect scaling. Use `timer:send_after` to avoid spawning too many processes.
+
+## Protocol Definition
+
+This section will make a list of all messages that will be sent and specify what they look like.
+
+Client - Event Server
+
+- Client monitors event server, since it doesn't work without the server. However, we do not want to assume client wants to crash when the server crashes.
+- Event server monitors client.
+- Subscription
+
+    Client →Event Server: `{subscribe, Self}`
+
+    Event Server → Client: `ok`
+
+- Add Event
+
+    Client → Event Server: `{add, Name, Description, TimeOut)`
+
+    Event Server → Client: `ok | {error, Reason}`
+
+- Remove Event
+
+    Client → Event Server: `{cancel, Name}`
+
+    Event Server → Client: `ok`
+
+- Notification
+
+    Event Server → Client: `{done, Name, Description}`
+
+- Shutdown
+
+    Client → Event Server: `shutdown`
+
+- Crash
+
+    Event Server → Client: `{'DOWN', Ref, process, Pid, shutdown}`
+
+Event Server - Event
+
+- Event servers are linked to events - we want all events to die if the server does.
+- Done
+
+    Event → Event Server: `{done, Id}`
+
+- Cancel
+
+    Event Server → Event: `cancel`
+
+    Event → Event Server: `ok`
+
+Shell - Event Server
+
+- Code Change
+
+    Shell → Event Server: `code_change`
+
+## Directory Structure
+
+Standard Erlang directory structure:
+
+- `ebin/` where files go once they are compiled
+- `include/` used to store `.hrl` files that are to be included by other applications
+- `priv/` executables that might have to interact with Erlang e.g. drivers
+- `src/` contains private `.hrl` files and main Erlang source
+
+Optional, non-standard directories:
+
+- `conf/` for configuration files
+- `doc/` for documentation files
+- `lib/` third party libraries required for application to run
