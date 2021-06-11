@@ -1616,7 +1616,7 @@ ok
 
 Every time a process being monitored goes down, a message `{'DOWN', MonitorReference, process, Pid, Reason}` is received. Since monitors are stackable, the reference allows the monitor-er to tear down the specific monitor.
 
-`monitor/2` takes the `process` atom and a pid, setting up a monitor from the current process on the processed identified by the pid.
+`monitor/2` takes the `process` atom and a pid, setting up a monitor from the current process on the processed identified by the pid. If a process with the Pid does not exist (e.g. already dead), the `'DOWN'` message is sent immediately with `Reason` set to `noproc`.
 
 `demonitor/1` accepts a monitor reference and tears down the monitor.
 
@@ -1788,15 +1788,404 @@ Shell - Event Server
 
 ## Directory Structure
 
-Standard Erlang directory structure:
+Erlang directory structure (standard OTP practice):
 
 - `ebin/` where files go once they are compiled
 - `include/` used to store `.hrl` files that are to be included by other applications
 - `priv/` executables that might have to interact with Erlang e.g. drivers
-- `src/` contains private `.hrl` files and main Erlang source
+- `src/` contains private `.hrl` files and main `.erl` source
 
 Optional, non-standard directories:
 
 - `conf/` for configuration files
 - `doc/` for documentation files
 - `lib/` third party libraries required for application to run
+
+An `Emakefile` can be used to help the Erlang compiler compile the `.beam` files
+
+```erlang
+{'src/*', [debug_info,
+           {i, "src"},
+           {i, "include"},
+           {outdir, "ebin"}]}.
+```
+
+The above tells the compiler to add `debug_info` to the files (apparently an option that is almost always included), look for files in the `src/` and `include/` directory, and output them in `ebin/`.
+
+- `erl -make` calls the compiler with the configuration specificed in the `Emakefile`
+- `erl -pa ebin/` starts the erlang shell with the bytecode in the `ebin/` folder. The `-pa directory` flag tells the Erlang VM to add the path to the places it looks for modules.
+
+You can also start the shell and call `make:all([load])`  to have the shell look for a file named 'Emakefile' in the current directory, recompile it if it changed and load the new files.
+
+## Event Module
+
+Messages will be wrapped in the form `{Pid, Ref, Message}`
+
+- `Pid` is the sender
+- `Ref` is a unique message identifier so that responses can be associated with messages
+
+State will have to contain data such as the timeout value, name of the event and the server's pid
+
+```erlang
+-module(event).
+-compile(export_all).
+-record(state, {server,
+							name="",
+							to_go=0}).
+
+loop(S = #state{server=Server}) ->
+	receive
+		{Server, Ref, cancel} ->
+			Server ! {Ref, ok}
+		after S#state.to_go*1000 ->
+			Server ! {done, S#state.name}
+	end.
+```
+
+Language wart: `S#state.server` is secretly expanded to `element(2, S)`, which isn't a valid pattern to match on. As such, in the above piece of code, `S#state.server` is bound to `Server`.
+
+```erlang
+1> c(event).
+{ok,event}
+2> rr(event, state).
+[state]
+3> spawn(event, loop, [#state{server=self(), name="test", to_go=5}]).
+<0.60.0>
+4> flush().
+ok
+5> flush().
+Shell got {done,"test"}
+ok
+```
+
+Erlang's timeout value is limited to about 50 days in milliseconds.
+
+```erlang
+-module(event).
+-export([start/2, start_link/2, cancel/1, init/3]).
+-record(state, {server, name="", to_go=[0]}).
+
+loop(S = #state{server=Server, to_go=[T|Next]}) ->
+  receive
+    {Server, Ref, cancel} -> 
+      Server ! {Ref, ok}
+  after T*1000 ->
+    if Next =:= [] ->
+      Server ! {done, S#state.name};
+    Next =/= [] ->
+      loop(S#state{to_go=Next})
+    end
+  end.
+
+%% Because Erlang is limited to about 49 days (49*24*60*60*1000) in
+%% milliseconds, the following function is used
+normalize(N) ->
+  Limit = 49*24*60*60,
+  [N rem Limit | lists:duplicate(N div Limit, Limit)].
+
+time_to_go(TimeOut={{_,_,_}, {_,_,_}}) ->
+  Now = calendar:local_time(),
+  ToGo = calendar:datetime_to_gregorian_seconds(TimeOut) - calendar:datetime_to_gregorian_seconds(Now),
+  Secs = if ToGo > 0  -> ToGo;
+          ToGo =< 0 -> 0
+        end,
+  normalize(Secs).
+
+%%% Event's innards
+init(Server, EventName, DateTime) ->
+  loop(#state{server=Server,
+              name=EventName,
+              to_go=time_to_go(DateTime)}).
+
+start(EventName, Delay) ->
+  spawn(?MODULE, init, [self(), EventName, Delay]).
+
+start_link(EventName, Delay) ->
+  spawn_link(?MODULE, init, [self(), EventName, Delay]).
+
+cancel(Pid) ->
+  %% Monitor in case the process is already dead
+  Ref = erlang:monitor(process, Pid),
+  Pid!{self(), Ref, cancel},
+  receive
+    {Ref, ok} ->
+      erlang:demonitor(Ref, [flush]),
+      ok;
+    {'DOWN', Ref, process, Pid, _Reason} ->
+      ok
+  end.
+```
+
+# Event Server
+
+Descriptions of events are kept in the event server rather than sent to the event, to avoid unnecessary traffic (since it will need to be sent back).
+
+Orddicts are used to store both clients and events - we're unlikely to have hundreds of them at once.
+
+```erlang
+-module(evserv).
+-compile([]).
+-record(state, {events,    %% list of #event{} records
+                clients}). %% list of Pids
+-record(event, {name="",
+                description="",
+                pid,
+                timeout={{1970,1,1},{0,0,0}}}).
+
+loop(S = #state{}) ->
+  receive
+    {Pid, MsgRef, {subscribe, Client}} ->
+      %% monitor clients to be notified when they go down
+      Ref = erlang:monitor(process, Client),
+      NewClients = orddict:store(Ref, Client, S#state.clients),
+      Pid!{MsgRef, ok},
+      loop(S#state{clients=NewClients});
+    {Pid, MsgRef, {add, Name, Description, Timeout}} ->
+      case valid_datetime(TimeOut) of
+        true ->
+          EventPid = event:start_link(Name, Timeout),
+          NewEvents = orddict:store(Name,
+                                    #event{name=Name,
+                                          description=Description,
+                                          pid=EventPid,
+                                          timeout=Timeout},
+                                          S#state.events),
+          Pid!{MsgRef, ok},
+          loop(S#state{events=NewEvents});
+        false ->
+          Pid!{MsgRef, {error, bad_timeout}},
+          loop(S)
+      end;
+    {Pid, MsgRef, {cancel, Name}} ->
+      Events = case orddict:find(Name, S#state.events) of
+                {ok, E} ->
+                  event:cancel(E#event.pid),
+                  orddict:erase(Name, S#state.events);
+                error ->
+                  S#state.events
+              end,
+      Pid!{MsgRef, ok},
+      loop(S#state{events=Events});
+    {done, Name} ->
+      case orddict:find(Name, S#state.events) of
+        {ok, E} ->
+          send_to_clients({done, E#event.name, E#event.description},
+                          S#state.clients),
+          NewEvents = orddict:erase(Name, S#state.events),
+          loop(S#state{events=NewEvents});
+        error ->
+          %% happens if event fires and is cancelled at the same time
+          loop(S)
+      end;
+    shutdown ->
+      %% other shutdown code goes here
+      exit(shutdown);
+    {'DOWN', Ref, process, _Pid, _Reason} ->
+      loop(S#state{clients=orddict:erase(Ref, S#state.clients)});
+    code_change ->
+      ?MODULE:loop(S);
+    Unknown ->
+      %% production system would log with a dedicated module
+      io:format("Unknown message: ~p~n", [Unknown]),
+      loop(State)
+  end.
+
+init() ->
+  %% Loading events from a static file could be done here.
+  %% You would need to pass an argument to init telling where the
+  %% resource to find the events is. Then load it from here.
+  %% Another option is to just pass the events straight to the server
+  %% through this function.
+  loop(#state{events=orddict:new(),
+              clients=orddict:new()}).
+
+send_to_clients(Msg, ClientDict) ->
+  orddict:map(fun(_Ref, Pid) -> Pid!Msg end, ClientDict).
+
+valid_datetime({Date,Time}) ->
+  try
+    calendar:valid_date(Date) andalso valid_time(Time)
+  catch
+    error:function_clause -> %% not in {{Y,M,D},{H,Min,S}} format
+    false
+  end;
+    valid_datetime(_) ->
+    false.
+ 
+%% unfortunately the calendar module does not such a function
+valid_time({H,M,S}) -> valid_time(H,M,S).
+valid_time(H,M,S) when H >= 0, H < 24,
+                      M >= 0, M < 60,
+                      S >= 0, S < 60 -> true;
+valid_time(_,_,_) -> false.
+```
+
+## Hot Code Loading
+
+To perform hot code loading, Erlang has a *code server*.  
+
+**code server:** is a VM process in charge of an *ETS table*, and in-memory database table. It holds two versions of a single module in memory and both version can run at once.
+
+A new version is automatically loaded when compiling with `c(Module)`, when loading with `l(Module)`, or with one of the functions of the code module.
+
+**local calls:** function calls you can make with functions that might not be exported, with the format `Atom(Args)`.
+
+**external calls:** can only be done with exported functions and has the form `Module:Function(Args)`.
+
+- When there are two versions of a module loaded in the VM, all local calls are done through the currently running version in a process
+- External calls are always done on the newest version of the code available in the code server
+- If local calls are made from within the external call, they are in the new version of the code.
+
+Given that processes do recursive calls to change state, new versions of an actor can be loaded with an external recursive call (.e.g. `?MODULE:loop/1`).
+
+If a third version of a module is loaded while a process is still running with the first one, that process gets killed by the VM, which assumes it was an orphan process without a supervisor or a way to upgrade itself. If the old version is not being run, it is dropped.
+
+It is possible to bind the process to a system module that will send messages whenever a new version of a module is loaded, giving more control to when code upgrades are performed (e.g. via a dedicated `MyModule:Upgrade(CurrentState)` which allows us to transform the state data structure to the new specification).
+
+```erlang
+-module(hotload).
+-export([server/1, upgrade/1]).
+ 
+server(State) ->
+	receive
+		update ->
+			NewState = ?MODULE:upgrade(State),
+			?MODULE:server(NewState);  %% loop in the new version of the module
+		SomeMessage ->
+				%% do something here
+				server(State)  %% stay in the same version no matter what.
+	end.
+ 
+upgrade(OldState) ->
+	%% to be implemented in the new version to transform state from old version
+```
+
+## Message Hiding
+
+```erlang
+start() ->
+	%% for large apps, register names with the global module or the gproc library
+  register(?MODULE, Pid=spawn(?MODULE, init, [])),
+  Pid.
+ 
+start_link() ->
+  register(?MODULE, Pid=spawn_link(?MODULE, init, [])),
+  Pid.
+ 
+terminate() ->
+  ?MODULE!shutdown.
+
+subscribe(Pid) ->
+	Ref = erlang:monitor(process, whereis(?MODULE)),
+	?MODULE!{Self(), Ref, {subscribe, Pid}},
+	receive
+		{Ref, ok} ->
+			{ok, Ref};
+		{'DOWN', Ref, process, _Pid, Reason} ->
+			{error, Reason}
+	after 5000 ->
+		{error, timeout}
+	end.
+
+add_event(Name, Description, TImeOut) ->
+	Ref = make_ref(),
+	?MODULE!{self(), Ref, {add, Name, Description, TimeOut}},
+	receive
+		{Ref, Msg} -> Msg
+	after 5000 ->
+		{error, timeout}
+	end.
+
+cancel(Name) ->
+  Ref = make_ref(),
+  ?MODULE!{self(), Ref, {cancel, Name}},
+  receive
+    {Ref, ok} -> ok
+  after 5000 ->
+    {error, timeout}
+  end.
+
+listen(Delay) ->
+  %% accumulates all messages during a given period of time
+  receive
+    M = {done, _Name, _Description} ->
+      [M | listen(0)]
+  after Delay * 1000 ->
+    []
+  end.
+```
+
+```erlang
+1> evserv:start().
+<0.34.0>
+2> evserv:subscribe(self()).
+{ok,#Ref<0.0.0.31>}
+3> evserv:add_event("Hey there", "test", FutureDateTime).
+ok
+4> evserv:listen(5).
+[]
+5> evserv:cancel("Hey there").
+ok
+6> evserv:add_event("Hey there2", "test", NextMinuteDateTime).
+ok
+7> evserv:listen(2000).
+[{done,"Hey there2","test"}]
+```
+
+## Adding Supervision
+
+```erlang
+-module(sup).
+-export([start/2, start_link/2, init/1, loop/1]).
+ 
+start(Mod,Args) ->
+  spawn(?MODULE, init, [{Mod, Args}]).
+ 
+start_link(Mod,Args) ->
+  spawn_link(?MODULE, init, [{Mod, Args}]).
+ 
+init({Mod,Args}) ->
+  process_flag(trap_exit, true),
+  loop({Mod,start_link,Args}).
+ 
+loop({M,F,A}) ->
+  Pid = apply(M,F,A),
+  receive
+    {'EXIT', _From, shutdown} ->
+      exit(shutdown); % will kill the child too
+    {'EXIT', Pid, Reason} ->
+      io:format("Process ~p exited for reason ~p~n",[Pid,Reason]),
+      loop({M,F,A})
+  end.
+```
+
+The above supervisor will restart the process it watches indefinitely until the supervisor itself is terminated with a shutdown exit signal.
+
+Killing the supervisor will also kill the linked child process.
+
+```erlang
+1> SupPid = sup:start(evserv, []).
+<0.43.0>
+2> whereis(evserv).
+<0.44.0>
+3> exit(whereis(evserv), die).
+true
+Process <0.44.0> exited for reason die
+4> exit(whereis(evserv), die).
+Process <0.48.0> exited for reason die
+true
+5> exit(SupPid, shutdown).
+true
+6> whereis(evserv).
+undefined
+```
+
+## Namespaces
+
+As Erlang has a flat module structure, some applications frequently enter conflicts (e.g. `user` module that almost every projects attempts to define, which clashes with the `user` module that ships with Erlang).
+
+Clashes can be tested with the function `code:clash/0`, which searches the entire code space for module names with identical names and writes a report to stdout.
+
+A common pattern is thus to prefix every module name with the name of your project. Some programmers add a module named after the application itself which wraps common calls that programmers could use when using their own application.
+
+Registered names and database tables also result in clashes.
