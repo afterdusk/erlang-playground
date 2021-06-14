@@ -2180,7 +2180,7 @@ true
 undefined
 ```
 
-## Namespaces
+# Namespaces
 
 As Erlang has a flat module structure, some applications frequently enter conflicts (e.g. `user` module that almost every projects attempts to define, which clashes with the `user` module that ships with Erlang).
 
@@ -2189,3 +2189,582 @@ Clashes can be tested with the function `code:clash/0`, which searches the entir
 A common pattern is thus to prefix every module name with the name of your project. Some programmers add a module named after the application itself which wraps common calls that programmers could use when using their own application.
 
 Registered names and database tables also result in clashes.
+
+# Open Telecom Platform
+
+> If half of Erlang's greatness comes from its concurrency and distribution and the other half from its error handling capabilities, then the OTP framework is the third half of it.
+
+The previous chapters demonstrated how we can write concurrent applications with the languages' built-in facilities: links, monitors, servers, timeouts, trapping exits, etc. There were some gotchas: avoiding race conditions, always remember that a process can die any time.
+
+Doing all of this manually is time consuming and sometimes prone to error. There are corner cases that are easily overlooked. The OTP framework takes care of this by grouping these essential practices into a set of libraries that have been carefully engineered and battle-hardened over years.
+
+The OTP framework is also a set of modules and standards designed to help you build applications. Given most Erlang programmers use OTP and thus Erlang applications tend to follow these standards.
+
+## The Common Process, Abstracted
+
+![images/Untitled2.png](images/Untitled2.png)
+
+Parts present in all concurrent programs
+
+OTP abstracts them into standard libraries built with far more caution (gen, sys, proc_lib), including functions to safely spawn and initialize processes, send messages to them in a fault-tolerant manner, and many other things.
+
+However, the abstractions these OTP libraries contain are so basic and universal that a lot more interesting things were built on top of them (gen_*, supervisors). We use those libraries instead.
+
+```erlang
+%%%%% Naive version
+-module(kitty_server).
+ 
+-export([start_link/0, order_cat/4, return_cat/2, close_shop/1]).
+ 
+-record(cat, {name, color=green, description}).
+ 
+%%% Client API
+start_link() -> spawn_link(fun init/0).
+ 
+%% Synchronous call
+order_cat(Pid, Name, Color, Description) ->
+	Ref = erlang:monitor(process, Pid),
+	Pid ! {self(), Ref, {order, Name, Color, Description}},
+	receive
+		{Ref, Cat} ->
+			erlang:demonitor(Ref, [flush]),
+			Cat;
+		{'DOWN', Ref, process, Pid, Reason} ->
+			erlang:error(Reason)
+	after 5000 ->
+		erlang:error(timeout)
+	end.
+ 
+%% Asynchronous call (does not wait for response)
+return_cat(Pid, Cat = #cat{}) ->
+	Pid ! {return, Cat},
+	ok.
+ 
+%% Synchronous call
+close_shop(Pid) ->
+	Ref = erlang:monitor(process, Pid),
+	Pid ! {self(), Ref, terminate},
+	receive
+		{Ref, ok} ->
+			erlang:demonitor(Ref, [flush]),
+			ok;
+		{'DOWN', Ref, process, Pid, Reason} ->
+			erlang:error(Reason)
+	after 5000 ->
+		erlang:error(timeout)
+	end.
+	 
+%%% Server functions
+init() -> loop([]).
+ 
+loop(Cats) ->
+	receive
+		{Pid, Ref, {order, Name, Color, Description}} ->
+			if Cats =:= [] ->
+					Pid ! {Ref, make_cat(Name, Color, Description)},
+					loop(Cats);
+				Cats =/= [] -> % got to empty the stock
+					Pid ! {Ref, hd(Cats)},
+					loop(tl(Cats))
+			end;
+		{return, Cat = #cat{}} ->
+			loop([Cat|Cats]);
+		{Pid, Ref, terminate} ->
+			Pid ! {Ref, ok},
+			terminate(Cats);
+		Unknown ->
+			%% do some logging here too
+			io:format("Unknown message: ~p~n", [Unknown]),
+			loop(Cats)
+	end.
+	 
+%%% Private functions
+make_cat(Name, Col, Desc) ->
+	#cat{name=Name, color=Col, description=Desc}.
+	 
+terminate(Cats) ->
+	[io:format("~p was set free.~n",[C#cat.name]) || C <- Cats],
+	ok.
+```
+
+The above is a kitty store. You describe a cat and you get that cat. If someone returns a cat, it's added to a list and is then automatically sent as the next order instead of what the client actually asked for.
+
+```erlang
+1> c(kitty_server).
+{ok,kitty_server}
+2> rr(kitty_server).
+[cat]
+3> Pid = kitty_server:start_link().
+<0.57.0>
+4> Cat1 = kitty_server:order_cat(Pid, carl, brown, "loves to burn bridges").
+#cat{name = carl,color = brown,
+description = "loves to burn bridges"}
+5> kitty_server:return_cat(Pid, Cat1).
+ok
+6> kitty_server:order_cat(Pid, jimmy, orange, "cuddly").
+#cat{name = carl,color = brown,
+description = "loves to burn bridges"}
+7> kitty_server:order_cat(Pid, jimmy, orange, "cuddly").
+#cat{name = jimmy,color = orange,description = "cuddly"}
+8> kitty_server:return_cat(Pid, Cat1).
+ok
+9> kitty_server:close_shop(Pid).
+carl was set free.
+ok
+```
+
+In the next part, we will abstract the common components out of the kitty server.
+
+## A Generic Server
+
+Synchronous and asynchronous calls can be abstracted to a generic call function. Async calls are typically referred to as "casts".
+
+```erlang
+call(Pid, Msg) ->
+    Ref = erlang:monitor(process, Pid),
+    Pid ! {sync, self(), Ref, Msg},
+    receive
+        {Ref, Reply} ->
+            erlang:demonitor(Ref, [flush]),
+            Reply;
+        {'DOWN', Ref, process, Pid, Reason} ->
+            erlang:error(Reason)
+    after 5000 ->
+        erlang:error(timeout)
+    end.
+```
+
+```erlang
+cast(Pid, Msg) ->
+    Pid ! {async, Msg},
+    ok.
+```
+
+The loop can be simplified to separate the pattern matching from the loop itself.
+
+```erlang
+loop(Module, State) ->
+    receive
+        {async, Msg} ->
+            loop(Module, Module:handle_cast(Msg, State));
+        {sync, Pid, Ref, Msg} ->
+            loop(Module, Module:handle_call(Msg, {Pid, Ref}, State))
+    end.
+```
+
+The client application needs to implement `handle_cast` and `handle_call` accordingly for each expected pattern.
+
+Note that `{Pid, Ref}` is intentionally put into a tuple so that they can be passed as a single argument as a variable like `From`. The user doesn't have to know anything about the tuple's innards, preventing the abstraction from leaking. We also provide a function to send replies that should understand what `From` contains.
+
+```erlang
+reply({Pid, Ref}, Reply) ->
+    Pid ! {Ref, Reply}.
+```
+
+We specify starter functions `start`, `start_link` and `init` that pass around the module names.
+
+```erlang
+%%% Public API
+start(Module, InitialState) ->
+    spawn(fun() -> init(Module, InitialState) end).
+
+start_link(Module, InitialState) ->
+    spawn_link(fun() -> init(Module, InitialState) end).
+
+%%% Private stuff
+init(Module, InitialState) ->
+    loop(Module, Module:init(InitialState)).
+```
+
+With the above generic server functions (inside a module `my_server`), we can rewrite the kitty store.
+
+```erlang
+-module(kitty_server2).
+-export([start_link/0, order_cat/4, return_cat/2, close_shop/1]). %% client API
+-export([init/1, handle_call/3, handle_cast/2]).                  %% my_server API
+
+-record(cat, {name, color = green, description}).
+
+%%% Client API
+start_link() ->
+    my_server:start_link(?MODULE, []).
+
+%% Synchronous call
+order_cat(Pid, Name, Color, Description) ->
+    my_server:call(Pid, {order, Name, Color, Description}).
+
+%% This call is asynchronous
+return_cat(Pid, Cat = #cat{}) ->
+    my_server:cast(Pid, {return, Cat}).
+
+%% Synchronous call
+close_shop(Pid) ->
+    my_server:call(Pid, terminate).
+
+%%% Server functions
+init([]) ->
+    []. %% no treatment of info here!
+
+handle_call({order, Name, Color, Description}, From, Cats) ->
+    if Cats =:= [] ->
+           my_server:reply(From, make_cat(Name, Color, Description)),
+           Cats;
+       Cats =/= [] ->
+           my_server:reply(From, hd(Cats)),
+           tl(Cats)
+    end;
+handle_call(terminate, From, Cats) ->
+    my_server:reply(From, ok),
+    terminate(Cats).
+
+handle_cast({return, Cat = #cat{}}, Cats) ->
+    [Cat | Cats].
+
+%%% Private functions
+make_cat(Name, Col, Desc) ->
+    #cat{name = Name,
+         color = Col,
+         description = Desc}.
+
+terminate(Cats) ->
+    [io:format("~p was set free.~n", [C#cat.name]) || C <- Cats],
+    exit(normal).
+```
+
+What we've just done is the core of OTP - taking all the generic components, extracting them into libraries, making sure they work well and then reusing that code whenever possible. All that's left is to focus on the things specific to the application.
+
+For small applications like the kitty server, abstraction is for little benefit. For large applications it is worth it to separate generic parts from specific parts.
+
+Adding servers adds complexity (code, testing, maintenance and understanding). By using common abstractions:
+
+- people understand the basic concept of the module immediately (e.g. it's a server)
+- there is a single generic implementation to test, document
+- if someone optimises the generic implementation, every process benefits (which is what happens with OTP)
+- unit testing modules are easier (e.g. no need to spawn a server, just test the `handle_call`)
+- bugs are less likely from human error
+
+Some things not explored in this section, but present in OTP `gen_server`:
+
+- configuring timeouts
+- adding debug information
+- handling unexpected messages
+- handling specific errors
+- hot code loading
+- abstracting away replies
+- handling server shutdown
+- working with supervisors
+
+# Clients and Servers
+
+`gen_server` is one of the most used OTP behaviours and has an interface similar to `my_server` from the previous section.
+
+Your application is expected to implement some functionis that `gen_server` will use.
+
+`init`
+
+- Initializes server state and do one-time tasks
+- Can return `{ok, State}`, `{ok, State, TimeOut}`, `{ok, State, hibernate}`, `{stop, Reason}` or `ignore`
+    - `State` will be passed directly to the main loop of the process as the state to keep later on
+    - `TimeOut` is meant to be added to the tuple whenever you need a deadline before which you expect the server to receive a message. If no message is received before deadline, the atom `timeout` will be sent to the server (`handle_info/2` should take care of this)
+    - `hibernate` can be returned if we expect the application process to take a long time before getting a reply - hibernation reduces the size of the process' state until it gets a message at the expense of some processing power
+    - `stop` is returned when something went wrong during the initialization
+- When `init/1` is running, execution is blocked in the process that spawned the server. It awaits a "ready" message to be sent automatically by the `gen_server`module
+
+When the BIF `erlang:hibernate(M, F, A)` is called, the call stack for the currently running process is discarded (the function never returns). Garbage collection kicks in and what's left is one continuous heap that is shrunken to the size of the data in the process. Once the process receives a message, the function `M:F` with `A` as the arguments is called and the execution resumes.
+
+`handle_call`
+
+- Handles synchronous messages and takes in `Request`, `From` and `State`
+- Can return `{reply,Reply,NewState}`, `{reply,Reply,NewState,Timeout}`, `{reply,Reply,NewState,hibernate}`, `{noreply,NewState}`, `{noreply,NewState,Timeout}`, `{noreply,NewState,hibernate}`, `{stop,Reason,Reply,NewState}` and `{stop,Reason,NewState}`
+    - `Timeout` and `hibernate` works in the same way as `init/1`
+    - `Reply` will be sent back to whoever called the server in the first place
+    - `noreply` tells the `gen_server` that you will take care of sending the reply back yourself with `gen_server:reply/2`. This is done when you want another process to send the reply for you or when you want to send an acknowledgment but still process it afterwards
+
+`handle_cast`
+
+- Handles asynchronous messages and takes the parameters `Message` and `State`
+- Can return `{noreply,NewState}`, `{noreply,NewState,Timeout}`, `{noreply,NewState,hibernate}` and
+`{stop,Reason,NewState}`
+
+`handle_info`
+
+- Used to handle messages that do not fit interface, behaving similarly to `handle_cast` but only handles messaages that were sent directly with the `!` operator and special messages like `init/1`'s `timeout`, monitors' notifications and `'EXIT'` signals
+    - Messages sent with `call` and `cast` do not result in a call to `handle_info`
+- Returns the same tuples as `handle_cast`
+
+`terminate`
+
+- Called whenever one of the three `handle_*` functions returns a tuple of the form `{stop, Reason, NewState}` or `{stop, Reason, Reply, NewState}`, taking in the parameters `Reason` and `State` from the tuples
+- Also called when its parent (the process that spawned the `gen_server`) dies, if and only if the `gen_server` is trapping exits
+- If terminate is called with anything other than `normal`, `shutdown` or `{shutdown, Term}` is used when `terminate/2` is called, the OTP framework will see this as a failure and start logging a bunch of stuff
+- This function should be seens as the opposite of `init/1`, closing or shutting down any resources initialized there
+- The return value of this function doesn't matter because the code stops executing after it's been called
+
+`code_change`
+
+- Serves to upgrade code, taking the form `code_change(PreviousVersion, State, Extra)`. `PreviousVersion` is either the version term itself in the case of an upgrade or `{down, Version}` in the case of a downgrade
+- Should return `{ok, NewState}` which should contain the transformed state to be passed into the target version
+
+## Behaviours
+
+A behaviour is basically a way for a module to specify functions it expects another module to have.
+
+It is the contract sealing the deal between the well-behaved generic part of the code and the specific, error-prone part of the code.
+
+Both `behaviour` and `behavior` are accepted by the Erlang compiler.
+
+```erlang
+-module(my_behaviour).
+-export([behaviour_info/1]).
+ 
+%% init/1, some_fun/0 and other/3 are now expected callbacks
+behaviour_info(callbacks) -> [{init,1}, {some_fun, 0}, {other, 3}];
+behaviour_info(_) -> undefined.
+```
+
+## Using gen_server
+
+`gen_server:start_link/3-4` , `gen_server:start/3-4`
+
+- The first parameter is the callback module, the second is the list of parameters to pass to `init/1` and the third is for debug options. An optional fourth parameter can be placed in the first position indicating the name to register the server with
+- Returns `{ok, Pid}`
+
+`gen_server:call/2-3`
+
+- A third parameter can be passed to call to give a timeout. If a timeout is not provided (or the timeout value is `infinity`), the default of 5 seconds is set. If no reply is received from the application before the time is up, the call crashes
+
+`gen_server:cast/2`
+
+```erlang
+-module(kitty_gen_server).
+
+-behaviour(gen_server).
+
+-export([start_link/0, order_cat/4, return_cat/2, close_shop/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3]).
+
+-record(cat, {name, color = green, description}).
+
+start_link() ->
+    gen_server:start_link(?MODULE, [], []).
+
+%% Synchronous call
+order_cat(Pid, Name, Color, Description) ->
+    gen_server:call(Pid, {order, Name, Color, Description}).
+
+%% This call is asynchronous
+return_cat(Pid, Cat = #cat{}) ->
+    gen_server:cast(Pid, {return, Cat}).
+
+%% Synchronous call
+close_shop(Pid) ->
+    gen_server:call(Pid, terminate).
+
+%%% Server functions
+init([]) ->
+    {ok, []}. %% no treatment of info here!
+
+handle_call({order, Name, Color, Description}, _From, Cats) ->
+    if Cats =:= [] ->
+           {reply, make_cat(Name, Color, Description), Cats};
+       Cats =/= [] ->
+           {reply, hd(Cats), tl(Cats)}
+    end;
+handle_call(terminate, _From, Cats) ->
+    {stop, normal, ok, Cats}.
+
+handle_cast({return, Cat = #cat{}}, Cats) ->
+    {noreply, [Cat | Cats]}.
+
+handle_info(Msg, Cats) ->
+    io:format("Unexpected message: ~p~n", [Msg]),
+    {noreply, Cats}.
+
+terminate(normal, Cats) ->
+    [io:format("~p was set free.~n", [C#cat.name]) || C <- Cats],
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    %% No change planned. The function is there for the behaviour,
+    %% but will not be used.
+    {ok, State}.
+
+%%% Private functions
+make_cat(Name, Col, Desc) ->
+    #cat{name = Name,
+         color = Col,
+         description = Desc}.
+```
+
+Usage of the kitty store implemented with `gen_server` is similar to the one we implemented without.
+
+# Rage Against the Finite-State Machines
+
+![images/Untitled3.png](images/Untitled3.png)
+
+Cat FSM
+
+![images/Untitled4.png](images/Untitled4.png)
+
+Dog FSM
+
+```erlang
+-module(cat_fsm).
+-export([start/0, event/2]).
+
+start() ->
+    spawn(fun() -> dont_give_crap() end).
+
+event(Pid, Event) ->
+    Ref = make_ref(), % won't care for monitors here
+    Pid ! {self(), Ref, Event},
+    receive
+        {Ref, Msg} ->
+            {ok, Msg}
+    after 5000 ->
+        {error, timeout}
+    end.
+
+dont_give_crap() ->
+    receive
+        {Pid, Ref, _Msg} ->
+            Pid ! {Ref, meh};
+        _ ->
+            ok
+    end,
+    io:format("Switching to 'dont_give_crap' state~n"),
+    dont_give_crap().
+```
+
+```erlang
+-module(dog_fsm).
+-export([start/0, squirrel/1, pet/1]).
+
+start() ->
+    spawn(fun() -> bark() end).
+
+squirrel(Pid) ->
+    Pid ! squirrel.
+
+pet(Pid) ->
+    Pid ! pet.
+
+bark() ->
+    io:format("Dog says: BARK! BARK!~n"),
+    receive
+        pet ->
+            wag_tail();
+        _ ->
+            io:format("Dog is confused~n"),
+            bark()
+    after 2000 ->
+        bark()
+    end.
+
+wag_tail() ->
+    io:format("Dog wags its tail~n"),
+    receive
+        pet ->
+            sit();
+        _ ->
+            io:format("Dog is confused~n"),
+            wag_tail()
+    after 30000 ->
+        bark()
+    end.
+
+sit() ->
+    io:format("Dog is sitting. Gooooood boy!~n"),
+    receive
+        squirrel ->
+            bark();
+        _ ->
+            io:format("Dog is confused~n"),
+            sit()
+    end.
+```
+
+## Generic Finite-State Machines
+
+`gen_fsm` is a specialised version of `gen_server`. Instead of handling calls and casts, a `gen_fsm` handles synchronous and synchronous events. Each state is represented by a function.
+
+The following callbacks must be implemented by the application to use the `gen_fsm` behaviour.
+
+`init`
+
+- Same as `init/1` as used for generic servers
+- Can return `{ok, StateName, Data}`, `{ok, StateName, Data, Timeout}`, `{ok, StateName, Data, hibernate}` and `{stop, Reason}`
+    - `stop`, `hibernate` and `Timeout` works in the same manner as `gen_server`
+    - `StateName` is an atom and represents the next callback function to be called
+
+`StateName`
+
+- `StateName/2-3` are placeholder names for the application to decide. If `init/1` returns the tuple `{ok, sitting, dog}`, the finite state machine will be in a sitting state
+    - This "state" is not the same kind of state as in `gen_server`, instead of dictating the context in which you will handle the next event
+    - There's no limit on how many of these functions you can have as long as they are exported
+- `StateName/2` is called for asynchronous events and take in `Event` (the actual message sent as an event) and `StateData` (the data carried over the calls). The event is sent with `send_event/2`
+- `StateName/2` can return the tuples `{next_state, NextStateName, NewStateData}`, `{next_state, NextStateName, NewStateData, Timeout}`, `{next_state, NextStateName, NewStateData, hibernate}` and `{stop, Reason, NewStateData}`
+- `StateName/3` is called for synchronous ones, except there is a `From` variable in between `Event` and `StateData`. `From` and `gen_fsm:reply/2` is used in the same way as it was for `gen_server`. The event is sent with `sync_send_sent/2-3`
+- `StateName/3` can return the following tuples
+
+    ```erlang
+    {reply, Reply, NextStateName, NewStateData}
+    {reply, Reply, NextStateName, NewStateData, Timeout}
+    {reply, Reply, NextStateName, NewStateData, hibernate}
+
+    {next_state, NextStateName, NewStateData}
+    {next_state, NextStateName, NewStateData, Timeout}
+    {next_state, NextStateName, NewStateData, hibernate}
+
+    {stop, Reason, Reply, NewStateData}
+    {stop, Reason, NewStateData}
+    ```
+
+    - `NextStateName` will determine the next function called
+
+`handle_event`
+
+- To handle global events that would trigger a specific reaction no matter the state, use the `handle_event/3` callback. Such events are sent with `send_all_state_event/2`
+- The function takes arguments similar to `StateName/2` with the exception that it accepts a `StateName` variable in between them, telling you what the state was when the event was received
+- Returns the same values as `StateName/2`
+
+`handle_sync_event`
+
+- Synchronous version of `handle_event`. These events are sent with `sync_send_all_state_event/2-3`
+- Takes the same parameters as `handle_event`
+- Returns the same tuples as `StateName/3`
+
+`code_change`
+
+- Works exactly the same as it did for `gen_server`, except that it takes an extra parameter when called like `code_change(OldVersion, StateName, Data, Extra)`
+- Returns a tuple of the form `{ok, NextStateName, NewStateData}`
+
+`terminate`
+
+- Acts like in generic servers. `terminate/3` should do the opposite of `init/1`
+
+## A Trading System Specification
+
+In this section, we implement a server where players speak and trade items. A broker is not used so that the system would be distributable.
+
+In short, the following actions should be possible:
+
+- ask for a trade
+- accept a trade
+- offer items
+- retract an offer
+- declare self as ready
+- brutally cancel the trade
+
+When each of these actions is taken, the other player's FSM should be made aware of it. Each player would talk to their FSM, which would talk to another player's FSM.
+
+When dealing with two identical processes communicating, we want to avoid synchronous calls as much as possible. If A sends B a message while B sends a message to A, they could both end up waiting for the other without every replying, causing a deadlock.
+
+We can wait for timeout, but there will be leftover messages in both processes' mailboxes.
+
+The simplest way is to avoid synchronous messages altogether.
+
+Note that in our problem, players can send synchronous messages to their FSMs because the FSM won't need to call the player and no deadlock can occur.
+
+![images/Untitled5.png](images/Untitled5.png)
