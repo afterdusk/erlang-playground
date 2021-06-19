@@ -1702,7 +1702,7 @@ This section will build a reminder app.
 - Given we have no persistent storage, we have to be able to update the code while it is running.
 - The interaction with the software will be done via the command line, which can be extended later.
 
-    ![images/Untitled1.png](images/Untitled1.png)
+    ![images/Untitled%201.png](images/Untitled%201.png)
 
 Event Server
 
@@ -2202,7 +2202,7 @@ The OTP framework is also a set of modules and standards designed to help you bu
 
 ## The Common Process, Abstracted
 
-![images/Untitled2.png](images/Untitled2.png)
+![images/Untitled%202.png](images/Untitled%202.png)
 
 Parts present in all concurrent programs
 
@@ -2456,9 +2456,11 @@ Some things not explored in this section, but present in OTP `gen_server`:
 
 # Clients and Servers
 
+## Generic Servers
+
 `gen_server` is one of the most used OTP behaviours and has an interface similar to `my_server` from the previous section.
 
-Your application is expected to implement some functionis that `gen_server` will use.
+Your application is expected to implement some function's that `gen_server` will use.
 
 `init`
 
@@ -2601,11 +2603,11 @@ Usage of the kitty store implemented with `gen_server` is similar to the one we 
 
 # Rage Against the Finite-State Machines
 
-![images/Untitled3.png](images/Untitled3.png)
+![images/Untitled%203.png](images/Untitled%203.png)
 
 Cat FSM
 
-![images/Untitled4.png](images/Untitled4.png)
+![images/Untitled%204.png](images/Untitled%204.png)
 
 Dog FSM
 
@@ -2705,7 +2707,7 @@ The following callbacks must be implemented by the application to use the `gen_f
     - There's no limit on how many of these functions you can have as long as they are exported
 - `StateName/2` is called for asynchronous events and take in `Event` (the actual message sent as an event) and `StateData` (the data carried over the calls). The event is sent with `send_event/2`
 - `StateName/2` can return the tuples `{next_state, NextStateName, NewStateData}`, `{next_state, NextStateName, NewStateData, Timeout}`, `{next_state, NextStateName, NewStateData, hibernate}` and `{stop, Reason, NewStateData}`
-- `StateName/3` is called for synchronous ones, except there is a `From` variable in between `Event` and `StateData`. `From` and `gen_fsm:reply/2` is used in the same way as it was for `gen_server`. The event is sent with `sync_send_sent/2-3`
+- `StateName/3` is called for synchronous ones, except there is a `From` variable in between `Event` and `StateData`. `From` and `gen_fsm:reply/2` is used in the same way as it was for `gen_server`. The event is sent with `sync_send_event/2-3`
 - `StateName/3` can return the following tuples
 
     ```erlang
@@ -2767,4 +2769,758 @@ The simplest way is to avoid synchronous messages altogether.
 
 Note that in our problem, players can send synchronous messages to their FSMs because the FSM won't need to call the player and no deadlock can occur.
 
-![images/Untitled5.png](images/Untitled5.png)
+![images/Untitled%205.png](images/Untitled%205.png)
+
+Overall flow
+
+![images/Untitled%206.png](images/Untitled%206.png)
+
+State transition diagram
+
+Both FSMs are in an idle state. When you ask Jim to trade, Jim has to accept before things move on. Then both of you can offer items or withdraw them. When you are both declaring yourself ready, the trade can take place. This is a simplified version of all that can happen and we'll see all possible cases with more detail in the next paragraphs.
+
+![images/Untitled%207.png](images/Untitled%207.png)
+
+At first, both finite-state machines start in the idle state. At this point, one thing we can do is ask some other player to negotiate with us.
+
+![images/Untitled%208.png](images/Untitled%208.png)
+
+We go into idle_wait mode in order to wait for an eventual reply after our FSM forwarded the demand. Once the other FSM sends the reply, ours can switch to negotiate.
+
+![images/Untitled%209.png](images/Untitled%209.png)
+
+The other player should also be in negotiate state after this. Obviously, if we can invite the other, the other can invite us. 
+
+![images/Untitled%2010.png](images/Untitled%2010.png)
+
+In the event the other player asks to trade at the same time we ask to trade, both FSms switch to idle_wait. If an FSM receives an ask negotiate message while in the idle_wait state, we know that this race condition is hit and both FSMs can move into the negotiate state.
+
+![images/Untitled%2011.png](images/Untitled%2011.png)
+
+We must support users offering items and then retracting the offer. All this does is forward our client's message to the other FSM. Both FSMs will need to hold a list of items offered by either player, so they can update that list when receiving such messages. 
+
+![images/Untitled%2012.png](images/Untitled%2012.png)
+
+To officialize the trade, we have to synchronize both players by using an intermediate state (as we did for idle and idle_wait).
+
+![images/Untitled%2013.png](images/Untitled%2013.png)
+
+As soon as our player is ready, our FSM asks Jim's FSM if he's ready. Pending its reply, our own FSM falls into its wait state. The reply we'll get will depend on Jim's FSM state: if it's in wait state, it'll tell us that it's ready. Otherwise, it'll tell us that it's not ready yet. That's precisely what our FSM automatically replies to Jim if he asks us if we are ready when in negotiate state.
+
+![images/Untitled%2014.png](images/Untitled%2014.png)
+
+Our finite state machine will remain in negotiate mode until our player says he's ready. Let's assume he did and we're now in the wait state. However, Jim's not there yet. This means that when we declared ourselves as ready, we'll have asked Jim if he was also ready and his FSM will have replied 'not yet'.
+
+![images/Untitled%2015.png](images/Untitled%2015.png)
+
+While waiting after Jim, who's still negotiating by the way, it is possible that he will try to send us more items or maybe cancel his previous offers. As soon as he changes the items offered, we go back into the negotiate state so we can either modify our own offer, or examine the current one and decide we're ready.
+
+![images/Untitled%2016.png](images/Untitled%2016.png)
+
+At some point, Jim will be ready to finalise the trade too. When this happens, his finite-state machine will ask ours if we are ready. What our FSM does is reply that we indeed are ready. We stay in the waiting state and refuse to move to the ready state though.
+
+![images/Untitled%2017.png](images/Untitled%2017.png)
+
+Because of the way messages are recieved, we could possibly only process item offer after we declared ourselves ready after both parties declare themselves ready (see image). If Jim had automatically moved to ready, he'd be caught waiting as we were still in negotiate.
+
+![images/Untitled%2018.png](images/Untitled%2018.png)
+
+When we receive ready from the other FSM, we send ready back again. This will create a superfluous ready message in one of the two FSMs, but we will just ignore it. We then send an ack message before moving to ready state.
+
+![images/Untitled%2019.png](images/Untitled%2019.png)
+
+In the ready state, we then use a simplified version of a two-phase commit. The ack event is used to kickstart the two-phase commit.
+
+Finally, we have to allow the trade to be cancelled at any time. This means that somehow, no matter what state we're in, we're going to listen to the "cancel" message from both sides and quit the transaction.
+
+```erlang
+-module(trade_fsm).
+-behaviour(gen_fsm).
+-record(state, {name = "", other, ownitems = [], otheritems = [], monitor, from}).
+
+%% public API
+-export([start/1, start_link/1, trade/2, accept_trade/1, make_offer/2, retract_offer/2,
+         ready/1, cancel/1]).
+%% gen_fsm callbacks
+-export([init/1, handle_event/3, handle_sync_event/4, handle_info/3, terminate/3,
+         code_change/4, idle/2, idle/3, idle_wait/2, idle_wait/3, negotiate/2, negotiate/3, wait/2,
+         ready/2, ready/3]).
+
+%%% PUBLIC API
+start(Name) ->
+    gen_fsm:start(?MODULE, [Name], []).
+
+start_link(Name) ->
+    gen_fsm:start_link(?MODULE, [Name], []).
+
+%% ask for a begin session. Returns when/if the other accepts
+trade(OwnPid, OtherPid) ->
+    gen_fsm:sync_send_event(OwnPid, {negotiate, OtherPid}, 30000).
+
+%% Accept someone's trade offer.
+accept_trade(OwnPid) ->
+    gen_fsm:sync_send_event(OwnPid, accept_negotiate).
+
+%% Send an item on the table to be traded
+make_offer(OwnPid, Item) ->
+    gen_fsm:send_event(OwnPid, {make_offer, Item}).
+
+%% Cancel trade offer
+retract_offer(OwnPid, Item) ->
+    gen_fsm:send_event(OwnPid, {retract_offer, Item}).
+
+%% Mention that you're ready for a trade. When the other
+%% player also declares being ready, the trade is done
+ready(OwnPid) ->
+    gen_fsm:sync_send_event(OwnPid, ready, infinity).
+
+%% Cancel the transaction.
+cancel(OwnPid) ->
+    gen_fsm:sync_send_all_state_event(OwnPid, cancel).
+
+%% Ask the other FSM's Pid for a trade session
+ask_negotiate(OtherPid, OwnPid) ->
+    gen_fsm:send_event(OtherPid, {ask_negotiate, OwnPid}).
+
+%% Forward the client message accepting the transaction
+accept_negotiate(OtherPid, OwnPid) ->
+    gen_fsm:send_event(OtherPid, {accept_negotiate, OwnPid}).
+
+%% forward a client's offer
+do_offer(OtherPid, Item) ->
+    gen_fsm:send_event(OtherPid, {do_offer, Item}).
+
+%% forward a client's offer cancellation
+undo_offer(OtherPid, Item) ->
+    gen_fsm:send_event(OtherPid, {undo_offer, Item}).
+
+%% Ask the other side if he's ready to trade.
+are_you_ready(OtherPid) ->
+    gen_fsm:send_event(OtherPid, are_you_ready).
+
+%% Reply that the side is not ready to trade
+%% i.e. is not in 'wait' state.
+not_yet(OtherPid) ->
+    gen_fsm:send_event(OtherPid, not_yet).
+
+%% Tells the other fsm that the user is currently waiting
+%% for the ready state. State should transition to 'ready'
+am_ready(OtherPid) ->
+    gen_fsm:send_event(OtherPid, 'ready!').
+
+%% Acknowledge that the fsm is in a ready state.
+ack_trans(OtherPid) ->
+    gen_fsm:send_event(OtherPid, ack).
+
+%% ask if ready to commit
+ask_commit(OtherPid) ->
+    gen_fsm:sync_send_event(OtherPid, ask_commit).
+
+%% begin the synchronous commit
+do_commit(OtherPid) ->
+    gen_fsm:sync_send_event(OtherPid, do_commit).
+
+notify_cancel(OtherPid) ->
+    gen_fsm:send_all_state_event(OtherPid, cancel).
+
+%%% GEN_FSM CALLBACKS
+init(Name) ->
+    {ok, idle, #state{name = Name}}.
+
+idle({ask_negotiate, OtherPid}, S = #state{}) ->
+    Ref = monitor(process, OtherPid),
+    notice(S, "~p asked for a trade negotiation", [OtherPid]),
+    {next_state, idle_wait, S#state{other = OtherPid, monitor = Ref}};
+idle(Event, Data) ->
+    unexpected(Event, idle),
+    {next_state, idle, Data}.
+
+idle({negotiate, OtherPid}, From, S = #state{}) ->
+    ask_negotiate(OtherPid, self()),
+    notice(S, "asking user ~p for a trade", [OtherPid]),
+    Ref = monitor(process, OtherPid),
+    {next_state,
+     idle_wait,
+     S#state{other = OtherPid,
+             monitor = Ref,
+             from = From}};
+idle(Event, _From, Data) ->
+    unexpected(Event, idle),
+    {next_state, idle, Data}.
+
+idle_wait({ask_negotiate, OtherPid}, S = #state{other = OtherPid}) ->
+    gen_fsm:reply(S#state.from, ok),
+    notice(S, "starting negotiation", []),
+    {next_state, negotiate, S};
+%% The other side has accepted our offer. Move to negotiate state
+idle_wait({accept_negotiate, OtherPid}, S = #state{other = OtherPid}) ->
+    gen_fsm:reply(S#state.from, ok),
+    notice(S, "starting negotiation", []),
+    {next_state, negotiate, S};
+idle_wait(Event, Data) ->
+    unexpected(Event, idle_wait),
+    {next_state, idle_wait, Data}.
+
+negotiate({make_offer, Item}, S = #state{ownitems = OwnItems}) ->
+    do_offer(S#state.other, Item),
+    notice(S, "offering ~p", [Item]),
+    {next_state, negotiate, S#state{ownitems = add(Item, OwnItems)}};
+%% Own side retracting an item offer
+negotiate({retract_offer, Item}, S = #state{ownitems = OwnItems}) ->
+    undo_offer(S#state.other, Item),
+    notice(S, "cancelling offer on ~p", [Item]),
+    {next_state, negotiate, S#state{ownitems = remove(Item, OwnItems)}};
+%% other side offering an item
+negotiate({do_offer, Item}, S = #state{otheritems = OtherItems}) ->
+    notice(S, "other player offering ~p", [Item]),
+    {next_state, negotiate, S#state{otheritems = add(Item, OtherItems)}};
+%% other side retracting an item offer
+negotiate({undo_offer, Item}, S = #state{otheritems = OtherItems}) ->
+    notice(S, "Other player cancelling offer on ~p", [Item]),
+    {next_state, negotiate, S#state{otheritems = remove(Item, OtherItems)}};
+negotiate(are_you_ready, S = #state{other = OtherPid}) ->
+    io:format("Other user ready to trade.~n"),
+    notice(S,
+           "Other user ready to transfer goods:~n"
+           "You get ~p, The other side gets ~p",
+           [S#state.otheritems, S#state.ownitems]),
+    not_yet(OtherPid),
+    {next_state, negotiate, S};
+negotiate(Event, Data) ->
+    unexpected(Event, negotiate),
+    {next_state, negotiate, Data}.
+
+negotiate(ready, From, S = #state{other = OtherPid}) ->
+    are_you_ready(OtherPid),
+    notice(S, "asking if ready, waiting", []),
+    {next_state, wait, S#state{from = From}};
+negotiate(Event, _From, S) ->
+    unexpected(Event, negotiate),
+    {next_state, negotiate, S}.
+
+wait({do_offer, Item}, S = #state{otheritems = OtherItems}) ->
+    gen_fsm:reply(S#state.from, offer_changed),
+    notice(S, "other side offering ~p", [Item]),
+    {next_state, negotiate, S#state{otheritems = add(Item, OtherItems)}};
+wait({undo_offer, Item}, S = #state{otheritems = OtherItems}) ->
+    gen_fsm:reply(S#state.from, offer_changed),
+    notice(S, "Other side cancelling offer of ~p", [Item]),
+    {next_state, negotiate, S#state{otheritems = remove(Item, OtherItems)}};
+wait(are_you_ready, S = #state{}) ->
+    am_ready(S#state.other),
+    notice(S, "asked if ready, and I am. Waiting for same reply", []),
+    {next_state, wait, S};
+wait(not_yet, S = #state{}) ->
+    notice(S, "Other not ready yet", []),
+    {next_state, wait, S};
+wait('ready!', S = #state{}) ->
+    am_ready(S#state.other),
+    ack_trans(S#state.other),
+    gen_fsm:reply(S#state.from, ok),
+    notice(S, "other side is ready. Moving to ready state", []),
+    {next_state, ready, S};
+%% Don't care about these!
+wait(Event, Data) ->
+    unexpected(Event, wait),
+    {next_state, wait, Data}.
+
+ready(ack, S = #state{}) ->
+    case priority(self(), S#state.other) of
+        true ->
+            try
+                notice(S, "asking for commit", []),
+                ready_commit = ask_commit(S#state.other),
+                notice(S, "ordering commit", []),
+                ok = do_commit(S#state.other),
+                notice(S, "committing...", []),
+                commit(S),
+                {stop, normal, S}
+            catch
+                Class:Reason ->
+                    %% abort! Either ready_commit or do_commit failed
+                    notice(S, "commit failed", []),
+                    {stop, {Class, Reason}, S}
+            end;
+        false ->
+            {next_state, ready, S}
+    end;
+ready(Event, Data) ->
+    unexpected(Event, ready),
+    {next_state, ready, Data}.
+
+ready(ask_commit, _From, S) ->
+    notice(S, "replying to ask_commit", []),
+    {reply, ready_commit, ready, S};
+ready(do_commit, _From, S) ->
+    notice(S, "committing...", []),
+    commit(S),
+    {stop, normal, ok, S};
+ready(Event, _From, Data) ->
+    unexpected(Event, ready),
+    {next_state, ready, Data}.
+
+%%% PRIVATE FUNCTIONS
+%% Send players a notice. This could be messages to their clients
+%% but for our purposes, outputting to the shell is enough.
+notice(#state{name = N}, Str, Args) ->
+    io:format("~s: " ++ Str ++ "~n", [N | Args]).
+
+%% Unexpected allows to log unexpected messages
+unexpected(Msg, State) ->
+    io:format("~p received unknown event ~p while in state ~p~n", [self(), Msg, State]).
+
+%% adds an item to an item list
+add(Item, Items) ->
+    [Item | Items].
+
+%% remove an item from an item list
+remove(Item, Items) ->
+    Items -- [Item].
+
+priority(OwnPid, OtherPid) when OwnPid > OtherPid ->
+    true;
+priority(OwnPid, OtherPid) when OwnPid < OtherPid ->
+    false.
+
+commit(S = #state{}) ->
+    io:format("Transaction completed for ~s. "
+              "Items sent are:~n~p,~n received are:~n~p.~n"
+              "This operation should have some atomic save "
+              "in a database.~n",
+              [S#state.name, S#state.ownitems, S#state.otheritems]).
+
+%% The other player has sent this cancel event
+%% stop whatever we're doing and shut down!
+handle_event(cancel, _StateName, S = #state{}) ->
+    notice(S, "received cancel event", []),
+    {stop, other_cancelled, S};
+handle_event(Event, StateName, Data) ->
+    unexpected(Event, StateName),
+    {next_state, StateName, Data}.
+
+handle_info({'DOWN', Ref, process, Pid, Reason},
+            _,
+            S = #state{other = Pid, monitor = Ref}) ->
+    notice(S, "Other side dead", []),
+    {stop, {other_down, Reason}, S};
+handle_info(Info, StateName, Data) ->
+    unexpected(Info, StateName),
+    {next_state, StateName, Data}.
+
+code_change(_OldVsn, StateName, Data, _Extra) ->
+    {ok, StateName, Data}.
+
+%% Transaction completed.
+terminate(normal, ready, S = #state{}) ->
+    notice(S, "FSM leaving.", []);
+terminate(_Reason, _StateName, _StateData) ->
+    ok.
+```
+
+Notes
+
+- The client calls the fsm synchronously (mostly), but the other FSM does it asynchronously. Having the client synchronous simplifies logic by limiting the contradicting messages that can be sent one after the other.
+- There'll be a few out of band messages that could be a result of race conditions. It's usually safe to ignore them but we can't easily get rid of them.
+- Using asynchronous messages on both sides for `negotiate` result in some difficulty differentiating between player-to-FSM and FSM-to-FSM communications.
+- When in the ready state, both players' actions become useless (except cancelling). We won't care about new item offers. To begin this commit without either player acting, we'll need the ack event to trigger an action from the FSMs.
+- `try ... catch`: if the replying FSM dies or its player cancels the transaction, the synchronous calls will crash after a timeout. The commit should be aborted in this case.
+- Even if the cancel or DOWN events happen while we're in the commit, everything should be safe and nobody should get its items stolen.
+
+The pids of any process can be compared to each other and sorted. This can be done no matter when the process was spawned, whether it's still alive or not, or if it comes from another VM (we'll see more about this when we get into distributed Erlang).
+
+Subtle concurrency bugs and race conditions can often rear their ugly heads a long time after they were written, and even if they've been running for years.
+
+# Event Handlers
+
+In our previous reminder app and trading system, we needed to notify a client process/application about an event that happened at some point of time.
+
+Using subscriber processes is pretty useful when each of the subscribers has a long-running operation to do after receiving an event. In simpler cases, where you do not necessarily want a subscriber process to be on standby, another approach is to use an event manager process.
+
+The event manager accepts functions and lets them run on any incoming event. This has the following advantages:
+
+- If there are many subscribers, the server can keep going because it only needs to forward events once (to the event manager)
+- If there is a lot of data to be transferred, it's only done once and all callbacks operate on the same instance of the data (in the event manager)
+- You don't need to spawn subscriber processes to handle short lived tasks
+
+Disadvantages:
+
+- If all functions need to run for a long time, they will block each other. In this case, the event manager can forward the event to a process, turning it into an event forwarder
+- In fact, a function that loops indefinitely can prevent any new event from being handled until something crashes
+
+## Generic Event Handlers
+
+Unlike `gen_server` and `gen_fsm`, you never need to start a process with the `gen_event` behaviour. It instead runs the process that accepts and calls functions, and you only provide a module with these functions. All managing is done for free and you only provide what's specific to your application.
+
+- In other words, the `gen_event` behaviour represents a single event handler. The event manager server does not need to be implemented, and is simply started with `gen_event:start_link()` (this can be wrapped in an abstractino module). Event handlers implementing the `gen_event` behaviour are then registered with this started process.
+
+Instead of the `spawn -> init -> loop -> terminate` pattern, we have `spawn event manager -> attach handler -> init handler -> loop -> exit handlers`.
+
+Each event handler can hold its own state, carried around by the manager for them. Each event handler does `init -> handle messages -> terminate`.
+
+`init` and `terminate`
+
+- Similar to what we've seen in the previous behaviours
+- `init/1` takes a list of arguments and returns `{ok, State}`. What happens in `init/1` should have its counterpart in `terminate/2`
+
+`handle_event`
+
+- `handle_event(Event, State)` is the core of `gen_event`'s callback modules. It works like `gen_server`'s `handle_cast/2` in that it is asynchronous.
+- It returns `{ok, NewState}`, `{ok, NewState, hibernate}` (which puts the event manager itself into hibernation until the next event), `remove_handler` and `{swap_handler, Args1, NewState, NewHandler, Args2}`
+    - `{ok, NewState}` works in a way similar to what we've seen with `gen_server:handle_cast/2` - it updates its own state and doesn't reply
+    - `{ok, NewState, hibernate}` the whole event manager is going to be put in hibernation (remember that event handlers run in the same process as the event manager)
+    - `remove_handler` drops the handler from the manager
+    - `{swap_handler, Args1, NewState, NewHandler, Args2}` is not used frequently. It removes the current event handler and replaces it with a new one by calling `NewHandler:init(Args2, ResultFromTerminate)`. This can be useful in the cases where you know some specific event happened and you want to give control to a new handler.
+- All incoming events can come from:
+    - `gen_event:notify/2` (asynchronous like `gen_server:cast/2`)
+    - `gen_event:sync_notify/2` (which is synchronous). Note that `handle_event/2` remains asynchronous - the idea here is that the function only returns once all event handlers have seen and treated the new message. Until then, the event manager will keep blocking the calling process by not replying.
+
+`handle_call`
+
+- Similar to `gen_server`'s `handle_call`. As there are multiple event handlers, we do not expect all of them to reply. We are forced to choose only one handler to reply.
+- Can return `{ok, Reply, NewState}`, `{ok, Reply, NewState, hibernate}`, `{remove_handler, Reply}` or `{swap_handler, Reply, Args1, NewState, Handler2, Args2}`.
+- `gen_event:call/3-4` is used to make the call.
+
+`handle_info`
+
+- Similar to `handle_event`, with the exception that it only treats out of band messages, such as exit signals, messages sent directly to the event manager with the `!` operator. Use cases similar to `handle_info` in `gen_server`/`gen_fsm`
+- Same return values as `handle_event`.
+
+`code_change`
+
+- Works in exactly the same manner as it does for `gen_server`, except it's for each individual event handler. It takes 3 arguments `OldVsn`, `State` and `Extra`.
+- Returns `{ok, NewState}`.
+
+## Curling Example
+
+In this section, we're making a set of event handlers used to track game updates for curling.
+
+In curling, there are two teams and they send a curling stone as close to the center of a red circle. They do this with 16 stones and the team with the stone closest to the center wins a point at the end of the round. There are 10 rounds and the team with the most points at the end of the rounds wins the game.
+
+In this problem, we program a system that will let some official enter game events, such as when a stone has been thrown, when a round ends or when a game is over, and then route these events to a scoreboard/stats system/reporter feeds.
+
+```erlang
+-module(curling_scoreboard_hw).
+-export([add_point/1, next_round/0, set_teams/2, reset_board/0]).
+
+%% This is a 'dumb' module that's only there to replace what a real hardware
+%% controller would likely do. The real hardware controller would likely hold
+%% some state and make sure everything works right, but this one doesn't mind.
+
+%% Shows the teams on the scoreboard.
+set_teams(TeamA, TeamB) ->
+    io:format("Scoreboard: Team ~s vs. Team ~s~n", [TeamA, TeamB]).
+
+next_round() ->
+    io:format("Scoreboard: round over~n").
+
+add_point(Team) ->
+    io:format("Scoreboard: increased score of team ~s by 1~n", [Team]).
+
+reset_board() ->
+    io:format("Scoreboard: All teams are undefined and all scores are 0~n").
+```
+
+```erlang
+-module(curling_scoreboard).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2, handle_info/2, code_change/3,
+         terminate/2]).
+
+init([]) ->
+    {ok, []}.
+
+handle_event(_, State) ->
+    {ok, State}.
+
+handle_call(_, State) ->
+    {ok, ok, State}.
+
+handle_info(_, State) ->
+    {ok, State}.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+```
+
+This is a skeleton that we can use for every `gen_event` callback module. For now, the scoreboard event handler itself won't need to do anything special except forward the calls to the hardware module.
+
+The events will come from `gen_event:notify/2` so the handling of the protocol should be done in `handle_event/2`.
+
+```erlang
+%% this event handler simply forwards events to hardware
+handle_event({set_teams, TeamA, TeamB}, State) ->
+    curling_scoreboard_hw:set_teams(TeamA, TeamB),
+    {ok, State};
+handle_event({add_points, Team, N}, State) ->
+    [curling_scoreboard_hw:add_point(Team) || _ <- lists:seq(1, N)],
+    {ok, State};
+handle_event(next_round, State) ->
+    curling_scoreboard_hw:next_round(),
+    {ok, State};
+handle_event(_, State) ->
+    {ok, State}.
+```
+
+```erlang
+1> c(curling_scoreboard_hw).
+{ok,curling_scoreboard_hw}
+2> c(curling_scoreboard).
+{ok,curling_scoreboard}
+3> {ok, Pid} = gen_event:start_link().
+{ok,<0.43.0>}
+4> gen_event:add_handler(Pid, curling_scoreboard, []).
+ok
+5> gen_event:notify(Pid, {set_teams, "Pirates", "Scotsmen"}).
+Scoreboard: Team Pirates vs. Team Scotsmen
+ok
+6> gen_event:notify(Pid, {add_points, "Pirates", 3}).
+ok
+Scoreboard: increased score of team Pirates by 1
+Scoreboard: increased score of team Pirates by 1
+Scoreboard: increased score of team Pirates by 1
+7> gen_event:notify(Pid, next_round).
+Scoreboard: round over
+ok
+8> gen_event:delete_handler(Pid, curling_scoreboard, turn_off).
+ok
+9> gen_event:notify(Pid, next_round).
+ok
+```
+
+In the above:
+
+- We're starting `gen_event` as a standalone process.
+- We attach our event handler dynamically with `gen_event:add_handler/3`. This can be done as many times as we need, however, this might cause problems when we want to work with a particular event handler in `handle_call`. If you want to call, add or delete a specific handler when there's more than one instance of it, you'll have to find a way to uniquely identify it (e.g. `make_ref()`, then add it by calling `gen_event:add_handler(Pid, {Module, Ref}` and thereafter using `{Module, Ref}` to talk to the specific handler ).
+- We then send messages to the event handler, which successfully calls the hardware module.
+- We then remove the handler. `turn_off` is an argument to `terminate/2`, which our current implementation ignores.
+- The handler is gone, but we can still send events to the event manager.
+
+Instead of calling the `gen_event` module directly, we can write an abstraction module that wraps what we need. This hides the implementation and also lets us specify what handlers are necessary to include for a standard curling game.
+
+```erlang
+-module(curling).
+-export([start_link/2, set_teams/3, add_points/3, next_round/1]).
+
+start_link(TeamA, TeamB) ->
+    {ok, Pid} = gen_event:start_link(),
+    %% The scoreboard will always be there
+    gen_event:add_handler(Pid, curling_scoreboard, []),
+    set_teams(Pid, TeamA, TeamB),
+    {ok, Pid}.
+
+set_teams(Pid, TeamA, TeamB) ->
+    gen_event:notify(Pid, {set_teams, TeamA, TeamB}).
+
+add_points(Pid, Team, N) ->
+    gen_event:notify(Pid, {add_points, Team, N}).
+
+next_round(Pid) ->
+    gen_event:notify(Pid, next_round).
+```
+
+Now that we've got the basic scoreboard done, we want international reporters to be able to get live data from our official in charge of updating our system. Each news organization will register their own handler that just forwards them the data they need.
+
+We add the following to our `curling.erl` module:
+
+```erlang
+%% Subscribes the pid ToPid to the event feed.
+%% The specific event handler for the newsfeed is
+%% returned in case someone wants to leave
+join_feed(Pid, ToPid) ->
+    HandlerId = {curling_feed, make_ref()},
+    gen_event:add_handler(Pid, HandlerId, [ToPid]),
+    HandlerId.
+
+leave_feed(Pid, HandlerId) ->
+    gen_event:delete_handler(Pid, HandlerId, leave_feed).
+```
+
+Joining the feed is done by inputting the right Pid for the event manager and the Pid to forward all the events to. This then returns a unique value that can then be used to unsubscribe from the feed.
+
+`{curling_feed, make_ref()}` is necessary because all news organizations will use the `curling_feed` handler, and as such a unique ref is necessary to distinguish each instance of `curling_feed` from the others.
+
+```erlang
+-module(curling_feed).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2, handle_info/2, code_change/3,
+         terminate/2]).
+
+%% this handler's state is just the new's organization's feed's Pid
+init([Pid]) ->
+    {ok, Pid}.
+
+handle_event(Event, Pid) ->
+    Pid ! {curling_feed, Event},
+    {ok, Pid}.
+
+handle_call(_, State) ->
+    {ok, ok, State}.
+
+handle_info(_, State) ->
+    {ok, State}.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+```
+
+```erlang
+1> c(curling), c(curling_feed).
+{ok,curling_feed}
+2> {ok, Pid} = curling:start_link("Saskatchewan Roughriders", "Ottawa Roughriders").
+Scoreboard: Team Saskatchewan Roughriders vs. Team Ottawa Roughriders
+{ok,<0.165.0>}
+3> HandlerId = curling:join_feed(Pid, self()).
+{curling_feed,#Ref<0.0.0.909>}
+4> curling:add_points(Pid, "Saskatchewan Roughriders", 2).
+Scoreboard: increased score of team Saskatchewan Roughriders by 1
+ok
+Scoreboard: increased score of team Saskatchewan Roughriders by 1
+5> flush().
+Shell got {curling_feed,{add_points,"Saskatchewan Roughriders",2}}
+ok
+6> curling:leave_feed(Pid, HandlerId).
+ok
+7> curling:next_round(Pid).
+Scoreboard: round over
+ok
+8> flush().
+ok
+```
+
+We added ourselves to the feed, got the updates, then left and stopped receiving them.
+
+Consider what would happen if one of the curling feed subscribers crashes. Do we keep the handler going on there? Ideally, we wouldn't have to.
+
+We change the call from `gen_event:add_handler/3` to `gen_event:add_sup_handler/3`, and now when the feed subscriber crashes, the handler is gone. 
+
+- Note that the curling feed subscriber is also the caller of `gen_event:add_handler.`
+
+On the opposite end, if the event manager crashes, the message `{gen_event_EXIT, Handler, Reason}` is sent back to the you (the curling feed subscriber).
+
+Whenever the caller uses `gen_event:add_sup_handler/3`, a link is set up between the caller and the event manager so both of them are supervised. `gen_event` predates monitors in Erlang and a commitment to backward compatibility introduces a bad wart. Because you could have the same process acting as the parent of many event handlers, the library doesn't ever unlink the processes except when they terminate for good.
+
+This means that everything goes alright when:
+
+- Your own process crashes: the supervised handler is terminated (with the call to `terminate({stop, Reason}, State)`).
+- Your handler itself crashes (but not the event manager): you will recieve `{gen_event_EXIT, HandlerId, Reason}`.
+
+When the event manager is shut down though, you will either:
+
+- Receive `{gen_event_EXIT, HandlerId, Reason}` then crash because you're not trapping exits.
+- Receive `{gen_event_EXIT, HandlerId, Reason}` then a standard `EXIT` message that is (possibly?) superfluous.
+
+Switching the event handler to a supervised one is thus safer but risks being annoying in some cases. Safety should come first.
+
+Retracing back to the problem, we want to add an additional event handler `curling_accumulator` to accumulate stats for any late feed subscribers. We add/modify the following interface functions to `curling`:
+
+```erlang
+start_link(TeamA, TeamB) ->
+    {ok, Pid} = gen_event:start_link(),
+    %% The scoreboard will always be there
+    gen_event:add_handler(Pid, curling_scoreboard, []),
+    %% Start the stats accumulator
+    gen_event:add_handler(Pid, curling_accumulator, []),
+    set_teams(Pid, TeamA, TeamB),
+    {ok, Pid}.
+
+%% Returns the current game state.
+game_info(Pid) ->
+    gen_event:call(Pid, curling_accumulator, game_data).
+```
+
+Note that `game_info/1` uses only `curling_accumulator` as a handler id as there's only ever going to be one instance of the handler. Also note that `curling_accumulator` starts automatically like the scoreboard.
+
+```erlang
+-module(curling_accumulator).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2, handle_info/2, code_change/3,
+         terminate/2]).
+
+-record(state, {teams = orddict:new(), round = 0}).
+
+init([]) ->
+    {ok, #state{}}.
+
+handle_event({set_teams, TeamA, TeamB}, S = #state{teams = T}) ->
+    Teams = orddict:store(TeamA, 0, orddict:store(TeamB, 0, T)),
+    {ok, S#state{teams = Teams}};
+handle_event({add_points, Team, N}, S = #state{teams = T}) ->
+    Teams = orddict:update_counter(Team, N, T),
+    {ok, S#state{teams = Teams}};
+handle_event(next_round, S = #state{}) ->
+    {ok, S#state{round = S#state.round + 1}};
+handle_event(_Event, Pid) ->
+    {ok, Pid}.
+
+handle_call(game_data, S = #state{teams = T, round = R}) ->
+    {ok, {orddict:to_list(T), {round, R}}, S};
+handle_call(_, State) ->
+    {ok, ok, State}.
+
+handle_info(_, State) ->
+    {ok, State}.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+```
+
+`curling_accumulator` should be able to hold state for the curling game: so far we have teams, score and rounds to track. This will be held in a state record, changed on each event received. Finally, we will only need to reply to the `game_data` call, as above.
+
+```erlang
+1> c(curling), c(curling_accumulator).
+{ok,curling_accumulator}
+2> {ok, Pid} = curling:start_link("Pigeons", "Eagles").
+Scoreboard: Team Pigeons vs. Team Eagles
+{ok,<0.242.0>}
+3> curling:add_points(Pid, "Pigeons", 2).
+Scoreboard: increased score of team Pigeons by 1
+ok
+Scoreboard: increased score of team Pigeons by 1
+4> curling:next_round(Pid).
+Scoreboard: round over
+ok
+5> curling:add_points(Pid, "Eagles", 3).
+Scoreboard: increased score of team Eagles by 1
+ok
+Scoreboard: increased score of team Eagles by 1
+Scoreboard: increased score of team Eagles by 1
+6> curling:next_round(Pid).
+Scoreboard: round over
+ok
+7> curling:game_info(Pid).
+{[{"Eagles",3},{"Pigeons",2}],{round,2}}
+```
+
+We are done with our curling scoring system. Note that the most common use of event handlers are actually to do with logging and system alarms.
+
+At this point, we've looked at the main OTP behaviours used in active code development. The remaining behaviours left to visit include those that act as glue to all of the worker processes.
+
+# Who Supervises The Supervisors?
+
+# Outstanding Reading List
+
+Dialyzer Paper
+
+Foldl vs Foldr
+
+BEAM
+
+escript
+
+# Tools
+
+Dialyzer: Static Type Checker
+
+escript: Erlang scripts
