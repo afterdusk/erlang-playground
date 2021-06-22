@@ -1689,6 +1689,8 @@ Named processes help processes continue to function even when a process that the
 However, atoms should never be created dynamically. Naming processes should be reserved for important services unique to an instance of a VM that stay alive for the entire lifetime of the application.
 If you need a transient named process or if its not unique to the VM, it is probably better represented as a group. Linking and restarting them together if they crash is a better option.
 
+The registers we've seen so far are local to the node. There is a `global:register_name/3` method that registers a name for an entire Erlang cluster.
+
 # Designing a Concurrent Application
 
 This section will build a reminder app.
@@ -3509,18 +3511,458 @@ At this point, we've looked at the main OTP behaviours used in active code devel
 
 # Who Supervises The Supervisors?
 
-# Outstanding Reading List
+Supervisors should start a worker process, link to it and trap exit signals with `process_flag(trap_exit, true)` to know when the process died and restart it.
 
-Dialyzer Paper
+Supervisors need to be configurable (e.g. to give up), be able to handle multiple workers, and define the dependencies between workers in case of failure.
 
-Foldl vs Foldr
+## Supervisor Concepts
 
-BEAM
+Supervisors are one of the simplest behaviours, but one of the hardest behaviours to write a good design with.
 
-escript
+Workers are defined as the opposite of supervisors. Supervisors are supposed to be processes which do nothing but make sure their children are restarted when they die, and workers are processes in charge of doing actual work and may die doing so. They are usually not trusted.
 
-# Tools
+Supervisors can supervise workers and other supervisors, while workers should never be used in any position except under another supervisor.
 
-Dialyzer: Static Type Checker
+Every process should be supervised so that:
 
-escript: Erlang scripts
+- They won't be orphaned and end up in a state where we are unsure if it is alive or not. Orphaned processes cause a gradual memory leak and your VM might suddenly die.
+- We can terminate applications in good order. With a supervised application, the top supervisor shuts down first, then that supervisor asks each of its children to terminate. A well-ordered VM shutdown is hard to do without all processes being part of a tree.
+
+## Using Supervisors
+
+Supervisors just have a single callback function to provide: `init/1`, which takes some arguments and returns `{ok, {{RestartStrategy, MaxRestart, MaxTime}, [ChildSpecs]}}`. 
+
+- `ChildSpec` stands for child specification
+- `RestartStrategy` is `one_for_one`, `rest_for_one`, `one_for_all` or `simple_one_for_one`
+- If more than `MaxRestart`s happen within `MaxTime` (seconds), the supervisor just gives up, shuts the children down then kills itself
+
+This can be complex looking.
+
+```erlang
+{ok, {{one_for_all, 5, 60},
+	[{fake_id,
+		{fake_mod, start_link, [SomeArg]},
+		permanent,
+		5000,
+		worker,
+		[fake_mod]},
+	{other_id,
+		{event_manager_mod, start_link, []},
+		transient,
+		infinity,
+		worker,
+		dynamic}]}}.
+```
+
+`one_for_one`
+
+- If your supervisor supervises many workers and one of them fails, only that one should be restarted.
+- Use whenever the processes being supervised are independent and not really related to each other, or when the process can restart and lose its state without impacting its sibilings.
+
+`one_for_all`
+
+- Restarts all supervised children at once.
+- Use when all your processes under a single supervisor heavily depend on each other to work normally.
+
+`rest_for_one`
+
+- When a process dies, all the ones that were started after it (and probably depend on it) get restarted, but not the other way around.
+- Use whenever you have to start processes that depend on each other in a chain (A starts B, which starts C etc), or when you have similar dependencies (X works alone, but Y depends on X and Z depends on both).
+
+`simple_one_for_one`
+
+- It takes only one kind of children, and thus knows how to create one dynamically. This can theoretically be done with `one_for_one`, but there advantages to using `simple_one_for_one`:
+    - `one_for_one` holds a list of all the children it has (and had, if you don't clear it) started in order
+    - `simple_one_for_one` holds a single definition for all its children and uses a `dict` to hold its data. When a process crashes, the `simple_one_for_one` supervisor will be much faster when you have a large number of children.
+- To be used when you want to dynamically add child processes to the supervisor, rather than having them started statically.
+
+## Child Specifications
+
+The child specification `ChidSpec` can be described in a more abstract form as `{ChildId, StartFunc, Restart, Shutdown, Type, Modules}`
+
+```erlang
+[{fake_id,
+	{fake_mod, start_link, [SomeArg]},
+	permanent,
+	5000,
+	worker,
+	[fake_mod]},
+{other_id,
+	{event_manager_mod, start_link, []},
+	transient,
+	infinity,
+	worker,
+	dynamic}]
+```
+
+`ChildId`
+
+- Internal name used by the supervisor. You will rarely need to use it yourself, although it might be useful for debugging purposes and sometimes when you need to get a list of all the children. Any term can used for the Id.
+
+`StartFunc`
+
+- Tuple that tells how to start the child, in the standard `{M, F, A}` format. It is very important that the starting function here is OTP-compliant and links to its caller when executed (by using `gen_*:start_link()` wrapped in your own module, all the time)
+
+`Restart`
+
+- Tells the supervisor how to react when that particular child dies. This can take three values:
+    - `permanent` should always be restarted, no matter what. This is usually used by vital, long-living processes running on your node.
+    - `temporary` should never be restarted. They are short=lived workers taht are expected to fail and have few bits of code which depend on them.
+    - `transient` meant to run until they terminate normally and then they won't be restarted. If they die with exit reason anything but `normal`, they will be restarted. This is often used for workers that need to succeed at their task but won't be used after.
+- A supervisor's `RestartStrategy` will interact with the child process' restart strategy to influence restart behaviour. With a `one_for_all` supervisor, a `temporary` process dying won't trigger all child processes to restart. However, the temporary process might be restarted if a permanent process dies first.
+
+`Shutdown`
+
+- When the top-level supervisor is asked to terminate, it calls `exit(ChildPid, shutdown)` on each of the Pids.
+    - If the child is a worker and trapping exists, it'll call it's own `terminate` function. Otherwise, it's going to die.
+    - When a supervisor gets the `shutdown` signal, it will forward it to its own children the same way.
+- The `Shutdown` value of a child specification is thus used to give a deadline on the termination (in milliseconds or `infinity`). If the time passes and nothing happens, the process is then killed with `exit(Pid, kill)`. An alternate value `brutal_kill` will make it so the child is killed immediately, which is untrappable and instantaneous.
+- Choosing a good `Shutdown` value is sometimes complex or tricky. If you have a chain of supervisors with `Shutdown` values like `5000 -> 2000 -> 5000 -> 5000`, the two last ones will likely end up brutawlly killed, because the second one had  a shorter cutoff time. The values are entirely application dependent.
+
+It is important to note that the `simple_one_for_one` children do not respect the `Shutdown` time. In the case of `simple_one_for_one`, the supervisor will just exit and the workers are left to terminate on their own after the supervisor is gone.
+
+`Type`
+
+- Type simply lets the supervisor know whether the child is a worker or a supervisor. This will be important when upgrading applications with more advanced OTP features. For now, we just need to make sure we set the correct values.
+
+`Modules`
+
+- A list of one element, the name of the callback module used by the child behaviour. The exception to that is when you have callback modules whose identity you do not know beforehand (e.g. event handlers in an event manager) - in this case, use `dynamic`.
+
+Since version 18.0, the supervisor structure can be provided as maps, of the form 
+`{#strategy ⇒ RestartStrategy, intensity ⇒ MaxRestart, period ⇒ MaxTime}, [#{id => ChildId, start => StartFunc, restart => Restart, shutdown => Shutdown, type => Type, modules => Module}}`. The `supervisor` module defines some default values, but having the whole specification explicit is probably good for readability.
+
+## Testing It Out
+
+In this example, we are managing a band with a drummer, a singer, a bass player and a keytar player.
+
+We implement the individual band members with a `gen_server` `musicians` module.
+
+```erlang
+-module(musicians).
+
+-behaviour(gen_server).
+
+-export([start_link/2, stop/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3,
+         terminate/2]).
+
+-record(state, {name = "", role, skill = good}).
+
+-define(DELAY, 750).
+
+start_link(Role, Skill) ->
+		%% {local, Role} registers this process with the Role as the name
+    gen_server:start_link({local, Role}, ?MODULE, [Role, Skill], []).
+
+stop(Role) ->
+    gen_server:call(Role, stop).
+
+init([Role, Skill]) ->
+    %% To know when the parent shuts down
+    process_flag(trap_exit, true),
+    TimeToPlay = rand:uniform(3000),
+    Name = pick_name(),
+    StrRole = atom_to_list(Role),
+    io:format("Musician ~s, playing the ~s entered the room~n", [Name, StrRole]),
+    {ok,
+     #state{name = Name,
+            role = StrRole,
+            skill = Skill},
+     TimeToPlay}.
+
+handle_call(stop, _From, S = #state{}) ->
+    {stop, normal, ok, S};
+handle_call(_Message, _From, S) ->
+    {noreply, S, ?DELAY}.
+
+handle_cast(_Message, S) ->
+    {noreply, S, ?DELAY}.
+
+handle_info(timeout, S = #state{name = N, skill = good}) ->
+    io:format("~s produced sound!~n", [N]),
+    {noreply, S, ?DELAY};
+handle_info(timeout, S = #state{name = N, skill = bad}) ->
+    case rand:uniform(5) of
+        1 ->
+            io:format("~s played a false note. Uh oh~n", [N]),
+            {stop, bad_note, S};
+        _ ->
+            io:format("~s produced sound!~n", [N]),
+            {noreply, S, ?DELAY}
+    end;
+handle_info(_Message, S) ->
+    {noreply, S, ?DELAY}.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+terminate(normal, S) ->
+    io:format("~s left the room (~s)~n", [S#state.name, S#state.role]);
+terminate(bad_note, S) ->
+    io:format("~s sucks! kicked that member out of the band! (~s)~n",
+              [S#state.name, S#state.role]);
+terminate(shutdown, S) ->
+    io:format("The manager is mad and fired the whole band! "
+              "~s just got back to playing in the subway~n",
+              [S#state.name]);
+terminate(_Reason, S) ->
+    io:format("~s has been kicked out (~s)~n", [S#state.name, S#state.role]).
+
+%% Yes, the names are based off the magic school bus characters'
+%% 10 names!
+pick_name() ->
+    %% the seed must be set for the random functions. Use within the
+    %% process that started with init/1
+    lists:nth(
+        rand:uniform(10), firstnames())
+    ++ " "
+    ++ lists:nth(
+           rand:uniform(10), lastnames()).
+
+firstnames() ->
+    ["Valerie",
+     "Arnold",
+     "Carlos",
+     "Dorothy",
+     "Keesha",
+     "Phoebe",
+     "Ralphie",
+     "Tim",
+     "Wanda",
+     "Janet"].
+
+lastnames() ->
+    ["Frizzle",
+     "Perlstein",
+     "Ramon",
+     "Ann",
+     "Franklin",
+     "Terese",
+     "Tennelli",
+     "Jamal",
+     "Li",
+     "Perlstein"].
+```
+
+In the above:
+
+- Each musician takes an instrument and a skill level as a parameter.
+- Once a musician has spawned, it shall start playing. We'll also have an option to stop them if needed.
+- In `init/1`, we start trapping exits so that `terminate/2` is called when the server's parents shuts down its children. The rest of the `init/1` function is setting a random seed and then creating a random name for itself.
+- The only message `handle_call` and `handle_cast` needs to take care of is the synchronous stop message.
+- If we received an unexpected message, we do not reply to it and the caller will crash. We set the timeout in the `{noreply, S, ?DELAY}` tuples. Each time the server times out, the musicians will play a note. If their skill level is good, nothing bad happens. If their skill level is bad, they'll have a one in five chance of playing a bad note, causing them to crash.
+    - `timeout` will be received by `handle_info` every `?DELAY` milliseconds, since the `gen_server` will not be receiving any other messages.
+- If we terminate with a `normal` reason, it means we've called the `stop/1` function and so we display that the musician left of their free will. In the case of a `bad_note` message, the musician will crash and we say the manager kicked him out of the game.  We then have the `shutdown` message which comes from the supervisor when it decides to fire all the musicians.
+
+We can manually start musicians like `musicians:start_link(bass, bad)`. We can stop them with `musicians:stop(Instrument)`.
+
+## Band Supervisor
+
+We'll have three grades of supervisors:
+
+- lenient supervisor: will fire a single member of the band at a time (`one_for_one`) until he gets fed up and fires all of them.
+- angry supervisor: will fire some of them (`rest_for_one`) on each mistake and will wait shorter before firing them all.
+- jerk supervisor: will fire the whole band each time someone makes a mistake (`one_for_all`), and give up if the bands fail even less often.
+
+```erlang
+-module(band_supervisor).
+-behaviour(supervisor).
+
+-export([start_link/1]).
+-export([init/1]).
+
+start_link(Type) ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, Type).
+
+%% The band supervisor will allow its band members to make a few
+%% mistakes before shutting down all operations, based on what
+%% mood he's in. A lenient supervisor will tolerate more mistakes
+%% than an angry supervisor, who'll tolerate more than a
+%% complete jerk supervisor
+init(lenient) ->
+    init({one_for_one, 3, 60});
+init(angry) ->
+    init({rest_for_one, 2, 60});
+init(jerk) ->
+    init({one_for_all, 1, 60});
+%% we use the same function signature for the interface function and the callback function
+init({RestartStrategy, MaxRestart, MaxTime}) ->
+    {ok,
+     {{RestartStrategy, MaxRestart, MaxTime},
+      [{singer, {musicians, start_link, [singer, good]}, permanent, 1000, worker, [musicians]},
+       {bass, {musicians, start_link, [bass, good]}, temporary, 1000, worker, [musicians]},
+       {drum, {musicians, start_link, [drum, bad]}, transient, 1000, worker, [musicians]},
+       {keytar,
+        {musicians, start_link, [keytar, good]},
+        transient,
+        1000,
+        worker,
+        [musicians]}]}}.
+```
+
+In the above:
+
+- The lenient supervisor will restart one musician will fail on the fourth failure in 60 seconds. The second one will accept only 2 failures and the jerk supervisor will only accept one failure every 60 seconds.
+- There are 3 good musicians. The musicians have different `Restarts` (permanent, transient or temporary) so the band could never work without a singer even if the current one left of his own will, but can continue without a bass player.
+    - `RestartStrategy` controls the supervisor behaviour in restarting processes when a crash happens, while the child spec's `Restarts` determine whether a process wants to be restarted after failure.
+
+```erlang
+1> c(band_supervisor).            
+{ok,band_supervisor}
+2> band_supervisor:start_link(lenient).
+Musician Carlos Terese, playing the singer entered the room
+Musician Janet Terese, playing the bass entered the room
+Musician Keesha Ramon, playing the drum entered the room
+Musician Janet Ramon, playing the keytar entered the room
+{ok,<0.623.0>}
+Carlos Terese produced sound!
+Janet Terese produced sound!
+Keesha Ramon produced sound!
+Janet Ramon produced sound!
+Carlos Terese produced sound!
+Keesha Ramon played a false note. Uh oh
+Keesha Ramon sucks! kicked that member out of the band! (drum)
+... <snip> ...
+Musician Arnold Tennelli, playing the drum entered the room
+Arnold Tennelli produced sound!
+Carlos Terese produced sound!
+Janet Terese produced sound!
+Janet Ramon produced sound!
+Arnold Tennelli played a false note. Uh oh
+Arnold Tennelli sucks! kicked that member out of the band! (drum)
+... <snip> ...
+Musician Carlos Frizzle, playing the drum entered the room
+... <snip for a few more firings> ...
+Janet Jamal played a false note. Uh oh
+Janet Jamal sucks! kicked that member out of the band! (drum)
+The manager is mad and fired the whole band! Janet Ramon just got back to playing in the subway
+The manager is mad and fired the whole band! Janet Terese just got back to playing in the subway
+The manager is mad and fired the whole band! Carlos Terese just got back to playing in the subway
+** exception error: shutdown
+3> band_supervisor:start_link(angry). 
+Musician Dorothy Frizzle, playing the singer entered the room
+Musician Arnold Li, playing the bass entered the room
+Musician Ralphie Perlstein, playing the drum entered the room
+Musician Carlos Perlstein, playing the keytar entered the room
+... <snip> ...
+Ralphie Perlstein sucks! kicked that member out of the band! (drum)
+...
+The manager is mad and fired the whole band! Carlos Perlstein just got back to playing in the subway
+4> band_supervisor:start_link(jerk).
+Musician Dorothy Franklin, playing the singer entered the room
+Musician Wanda Tennelli, playing the bass entered the room
+Musician Tim Perlstein, playing the drum entered the room
+Musician Dorothy Frizzle, playing the keytar entered the room
+... <snip> ...
+Tim Perlstein played a false note. Uh oh
+Tim Perlstein sucks! kicked that member out of the band! (drum)
+The manager is mad and fired the whole band! Dorothy Franklin just got back to playing in the subway
+The manager is mad and fired the whole band! Wanda Tennelli just got back to playing in the subway
+The manager is mad and fired the whole band! Dorothy Frizzle just got back to playing in the subway
+```
+
+## Dynamic Supervision
+
+The type of supervision we've seen thus far is static - we specify the children right in the source code. This is the usual use case, where your processes are architectural components.
+
+Dynamic supervisors act over undetermined workers which are spawned on an on-demand basis (e.g. a web server that spawns a process per connection it receives).
+
+Every time a worker is added to a supervisor using the `one_for_one`, `rest_for_one` or `one_for_all` strategies, the child spec is added to a list in the supervisor along with a pid and some other information. It is then used to restart the child and whatnot.
+
+The supervisor module has the following interface:
+
+- `start_child(SupervisorNameOrPid, ChildSpec)`
+
+    This adds a child specification to the list and starts the child with it
+
+- `terminate_child(SupervisorNameOrPid, ChildId)`
+
+    Terminates or brutal_kills the child. The child specification is left in the supervisor
+
+- `restart_child(SupervisorNameOrPid, ChildId)`
+
+    Uses the child specification to get things rolling.
+
+- `delete_child(SupervisorNameOrPid, ChildId)`
+
+    Gets rid of the ChildSpec of the specified child
+
+- `check_childspecs([ChildSpec]`
+
+    Makes sure a child specification is valid. You can use this to try it before using 'start_child/2'.
+
+- `count_children(SupervisorNameOrPid)`
+
+    Counts all the children under the supervisor and gives you a little comparative list of who's active, how many specs there are, how many are supervisors and how many are workers.
+
+- `which_children(SupervisorNameOrPid)`
+
+    gives you a list of all the children under the supervisor.
+
+```erlang
+1> band_supervisor:start_link(lenient).
+{ok,0.709.0>}
+2> supervisor:which_children(band_supervisor).
+[{keytar,<0.713.0>,worker,[musicians]},
+{drum,<0.715.0>,worker,[musicians]},
+{bass,<0.711.0>,worker,[musicians]},
+{singer,<0.710.0>,worker,[musicians]}]
+3> supervisor:terminate_child(band_supervisor, drum).
+ok
+4> supervisor:terminate_child(band_supervisor, singer).
+ok
+5> supervisor:restart_child(band_supervisor, singer).
+{ok,<0.730.0>}
+6> supervisor:count_children(band_supervisor).
+[{specs,4},{active,3},{supervisors,0},{workers,4}]
+7> supervisor:delete_child(band_supervisor, drum).    
+ok
+8> supervisor:restart_child(band_supervisor, drum). 
+{error,not_found}
+9> supervisor:count_children(band_supervisor).    
+[{specs,3},{active,3},{supervisors,0},{workers,3}]
+```
+
+Because the children (what exactly though?) are maintained in a list, dynamically managing a large number of child processes is inefficient. In this case, use `simple_one_for_one`. 
+
+- Disadvantages
+    - You cannot manually restart a child, delete it or terminate it.
+
+Since version R14B03, it is possible to terminate children with the function. Simple one for one supervision schemes are now possible to make fully dynamic.
+
+- Advantages
+    - All the children are held in a dictionary, which makes looking them up fast.
+    - There is a single child specification for all children under the supervisor, saving time and memory in that you will never need to delete a child yourself or store any child spec.
+
+Writing a `simple_one_for_one` supervisor is similar to writing any other type of supervisor, except for one thing. The argument list in `{M, F, A}` is not the whole thing, but is going to be appended to what you call it with when you do `supervisor:start_child(Sup, Args)`. Note that `supervisor:start_child/2` changes API.
+
+- The old `supervisor:start_child(Sup, Spec)` calls `erlang:apply(M, F, A)`
+- `supervisor:start_child(Sup, Args)` calls `erlang:apply(M, F, A++Args)`
+
+```erlang
+%% use simple_one_for_one supervisor instead
+init(jamband) ->
+    {ok,
+     {{simple_one_for_one, 3, 60},
+      [{jam_musician, {musicians, start_link, []}, temporary, 1000, worker, [musicians]}]}}.
+```
+
+```erlang
+1> band_supervisor:start_link(jamband).
+{ok,<0.82.0>}
+2> supervisor:start_child(band_supervisor, [djembe, good]).
+Musician Wanda Perlstein, playing the djembe entered the room
+{ok,<0.84.0>}
+3> supervisor:start_child(band_supervisor, [drum, good]).
+Musician Ralphie Ann, playing the drum entered the room
+{ok,<0.86.0>}
+4> musicians:stop(drum).
+Ralphie Ann left the room (drum)
+ok
+```
+
+As a general rule:
+
+- Use stand supervisors dynamically only when you know with certainty that you will have few children to supervise and/or they won't need to be manipulated frequently with any speed.
+- For other kinds of dynamic supervision, use `simple_one_for_one` where possible.
