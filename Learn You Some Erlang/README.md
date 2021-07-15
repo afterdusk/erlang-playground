@@ -3530,7 +3530,7 @@ Every process should be supervised so that:
 
 ## Using Supervisors
 
-Supervisors just have a single callback function to provide: `init/1`, which takes some arguments and returns `{ok, {{RestartStrategy, MaxRestart, MaxTime}, [ChildSpecs]}}`. 
+Supervisors just have a single callback function to provide: `init/1`, which takes some arguments and returns `{ok, {{RestartStrategy, MaxRestart, MaxTime}, [ChildSpecs]}}`.
 
 - `ChildSpec` stands for child specification
 - `RestartStrategy` is `one_for_one`, `rest_for_one`, `one_for_all` or `simple_one_for_one`
@@ -3964,5 +3964,1322 @@ ok
 
 As a general rule:
 
-- Use stand supervisors dynamically only when you know with certainty that you will have few children to supervise and/or they won't need to be manipulated frequently with any speed.
+- Use standard supervisors dynamically only when you know with certainty that you will have few children to supervise and/or they won't need to be manipulated frequently with any speed.
 - For other kinds of dynamic supervision, use `simple_one_for_one` where possible.
+
+# Building an Application With OTP
+
+> An Erlang application is a group of related code and processes. An OTP application specifically uses OTP behaviours for its processes, and then wraps them in a very specific structure that tells the VM how to set everything up and then tear it down.
+
+In this chapter, we build an application with OTP components, but not a full OTP one (less the wrapping). We will implement a process a pool to manage and limit resources running in a system in a generic manner.
+
+## A Pool of Processes
+
+A pool:
+
+- Allows us to limit how many processes run at once
+- Can queue up jobs when the running workers limit is hit. The jobs can then be ran as soon as resources are freed up or simply block by telling the user they can't do anything else.
+
+Reasons to use a process pool:
+
+- Limiting a server to N concurrent connections at most
+- Limiting how many files can be opened by an application
+- Giving different priorities to different subsystems of a release by allowing more resources for some and less for others
+- Allowing an application under occasional heavy loads coming in bursts to remain more stable during its entire life by queuing the tasks
+
+Thus, the process pool needs to support the following functions:
+
+- Starting and stopping the application (which contains process pools)
+- Starting and stopping the particular process pool
+- Running a task in the pool and telling the client it can't be started if the pool if already full
+- Running a task in the pool if there's room, otherwise keep the client waiting while the task is in the queue. Free the caller once the task can be run
+- Running a task asynchronously in the pool, as soon as possible. If no place is available, queue it up and run it whenever
+
+## The Onion Layer Theory
+
+To design an application with supervisors, start by having an idea of what needs supervision and what kind.
+
+One thing that is often troublesome to deal with is the loss of state when processes are killed. Types of state:
+
+- Static state. This type can be easily fetched from a config file, another process or the supervisor restarting your application.
+- Dynamic state, composed of data that can be re-computed. This includes state that you had to transform from its initial form to get where it is right now.
+- Dynamic state that cannot be re-computed. This might include user input, live data, sequences of external events, etc.
+
+For the first two, most of the time you can get it straight from the supervisor. Any computation can be performed in the `init/1` function.
+
+For the last type of state, it can only be hoped that its not lost. In some cases, the data is pushed to a database although that won't always be a good option.
+
+An *onion layered system* is to allow all these different states to be protected correctly by isolating different kinds of code from each other. i.e. process segregation.
+
+- Static state: Handled by supervisors as the system is being started up. Each time a child dies, the supervisor restarts them and can inject them with some form of static state. Because most supervisor definitions are static by nature, each layer of supervision acts as a shield protecting the application against failure and loss of state.
+- Dynamic state that can be recomputed: Build it from static data send by supervisors, fetch it back from some other process/database/text file/current environment. It should be relatively easy to get it back on each restart.
+- Dynamic state that cannot be recomputed: The most important data (or the hardest to find back) has to be the most protected type. The places where you are actually not allowed to fail is called the *error kernel* of your application.
+
+The error kernel is likely the place where you'll want to use `try ... catch` more than anywhere else, where handling exceptional cases is vital and we strive to make error-free. Careful testing should be done, especially in cases where there is no way to go back (e.g. transactions).
+
+Essentially, we want to keep vital data in the safest core possible, and everything somewhat dangerous outside of it. All operations related together should be part of the same supervision trees, and the unrelated ones should be kept in different trees.
+
+Within the same tree, operations that are failure-prone but not vital can be in a separate sub-tree. We restart only the parts of the tree as needed. 
+
+## A Pool's Tree
+
+There are two approaches:
+
+- Design bottom-up - write all individual components, put them together as required.
+- Write things top-down - design as if all the parts were there, then build them.
+
+We will use a top-down approach in this section.
+
+There will be one `gen_server` per pool. The server's job will be to:
+
+- Maintain the counter of how many workers are in the the pool.
+- Hold the queue of tasks.
+
+Advantage of having the `gen_server` overlooking each of the workers: As it needs to track the processes to count them, supervising them itself is a nifty way to do it. Moreover, neither the server nor the processes can crash without losing the state of all the others.
+
+Disadvantage: The server has many responsibilities, can be seen as more fragile and duplicates the functionality of existing, better tested modules.
+
+Instead, we use a supervisor just for managing the workers, to make sure all workers are properly accounted for.
+
+![images/Untitled%2020.png](images/Untitled%2020.png)
+
+Proposed architecture
+
+There's a single supervisor for all the pools. Each pool is a set of a pool server and a supervisor for workers.
+
+Each pool is set of a pool server and a supervisor for workers. 
+
+- The pool server knows the existence of its worker supervisor and asks it to add items.
+- Given adding children is dynamic with unknown limits, a `simple_one_for_one` supervisor shall be used. Advantage:
+    - `worker_sup` will need to track only OTP workers of a single type and each pool is guaranteed to be about a well defined kind of worker
+    - The management and restart strategies are easy to define
+    - Each worker pool is separate from other worker pools, and incorrect code or runtime bugs in one pool won't cause problems in other pools
+
+As the pools are under the same supervisor, a given pool or server restarting too many times in a short time span can take all the other pools down. As such, we can add one level of supervision to make it easier to handler than one pool at a time.
+
+![images/Untitled%2021.png](images/Untitled%2021.png)
+
+Modified architecture
+
+From the onion layer perspective, all pools are independent, the workers are independent from each other and the `ppool_serv` is going to be isolated from all the workers.
+
+## Implementing the Supervisors
+
+### `ppool_supersup`
+
+`ppool_supersup` only has to start the supervisor of a pool when required. It needs the following functions:
+
+- `start_link/0` starts the whole application
+- `stop/0` stops the application
+- `start_pool/3` creates a specific pool
+- `stop_pool/1` stops a specific pool
+- `init/1` supervisor callback
+
+```erlang
+-module(ppool_supersup).
+-behaviour(supervisor).
+
+-export([start_link/0, stop/0, start_pool/3, stop_pool/1]).
+-export([init/1]).
+
+start_link() ->
+    supervisor:start_link({local, ppool}, ?MODULE, []).
+
+%% technically, a supervisor can not be killed in an easy way.
+%% Let's do it brutally!
+stop() ->
+    case whereis(ppool) of
+        P when is_pid(P) ->
+            exit(P, kill);
+        _ ->
+            ok
+    end.
+
+init([]) ->
+    MaxRestart = 6,
+    MaxTime = 3600,
+    {ok, {{one_for_one, MaxRestart, MaxTime}, []}}.
+
+start_pool(Name, Limit, MFA) ->
+    ChildSpec =
+        {Name,
+         {ppool_sup, start_link, [Name, Limit, MFA]},
+         permanent,
+         10500,
+         supervisor,
+         [ppool_sup]},
+    supervisor:start_child(ppool, ChildSpec).
+
+stop_pool(Name) ->
+    supervisor:terminate_child(ppool, Name),
+    supervisor:delete_child(ppool, Name).
+```
+
+- The top level pool supervisor has the name `ppool`. We know we will only have one `ppool` per Erlang node and we can give it a name without worrying about clashes.
+- The name is used to stop the whole set of pools. Furthermore, the supervisor cannot be terminated gracefully, as OTP provides a well-defined shutdown procedure for all supervisors (but we can't use it from where we are right now).
+- As the top level supervisor holds pools in memory and supervises them, it doesn't have any static children.
+- `start_pool` needs two parameters, the number of workers that it will accept and the `{M, F, A}` typle that the worker supervisor will need to start each worker. Spec:
+    - Each pool supervisor is asked to be permanent.
+    - Name of the pool is both passed to the supervisor and used as an identifier in the child spec.
+    - Maximum shutdown time of 10500. This is chosen arbitrarily with the intention of being large enough that all the children will have time to stop. Use `infinity` if you really don't know.
+- To stop the pool, we ask the `ppool` supersup to kill the matching child.
+
+### `ppool_sup`
+
+Each `ppool_sup` will be in charge of the pool server and worker supervisor.
+
+As the `ppool_serv` should be able to contact the `worker_sup` process, if we were to have them started by the same supervisor at the same time, we won't have any way to let `ppool_serv` know about `worker_sup` unless we:
+
+- Utilize`supervisor:which_children/1` (which would be sensitive to timing and risky).
+- Give a name to both `ppool_serv` (so users can call it) and `worker_sup`.  This is undesirable as the users do not need to call `worker_sup` directly and we would be generating atoms dynamically.
+
+Instead, a better way would be to get the pool server to dynamically attach the worker supervisor to its `ppool_sup`. 
+
+```erlang
+-module(ppool_sup).
+-behaviour(supervisor).
+
+-export([start_link/3, init/1]).
+
+start_link(Name, Limit, MFA) ->
+		supervisor:start_link(?MODULE, {Name, Limit, MFA}).
+ 
+init({Name, Limit, MFA}) ->
+    MaxRestart = 1,
+    MaxTime = 3600,
+    {ok, {{one_for_all, MaxRestart, MaxTime},
+         [{serv,
+            {ppool_serv, start_link, [Name, Limit, self(), MFA]},
+            permanent,
+            5000, % Shutdown time
+            worker,
+            [ppool_serv]}]}}.
+```
+
+- The `Name` passed to `ppool_serv`, along with the supervisor's own pid. This will let `ppool_serv` call for the spawning of the worker supervisor - the `MFA` variable will be used in that call to let the `simple_one_for_one` supervisor know what kind of workers to run.
+
+```erlang
+-module(ppool_worker_sup).
+-behaviour(supervisor).
+
+-export([start_link/1, init/1]).
+ 
+start_link(MFA = {_,_,_}) ->
+    supervisor:start_link(?MODULE, MFA).
+ 
+init({M,F,A}) ->
+    MaxRestart = 5,
+    MaxTime = 3600,
+    {ok, {{simple_one_for_one, MaxRestart, MaxTime},
+        [{ppool_worker,
+        {M,F,A},
+        temporary, 5000, worker, [M]}]}}.
+```
+
+- `simple_one_for_one` is used because workers could be added in very high numbers with a requirement for speed, plus the type of workers should be restricted.
+- All the workers are temporary as:
+    - We cannot know for sure whether they need to be restarted or not in case of failure and what kind of restart strategy would be required.
+    - Furthermore, the pool might only be useful if the worker's creator can have access to the worker's PID, and to achieve this with restarts requires the pool to track the creator and notify them of PID changes.
+
+## Working on the Workers
+
+The pool server contains the business logic of the application. 
+
+```erlang
+-module(ppool_serv).
+-behaviour(gen_server).
+
+-export([start/4, start_link/4, run/2, sync_queue/2, async_queue/2, stop/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,code_change/3, terminate/2]).
+ 
+start(Name, Limit, Sup, MFA) when is_atom(Name), is_integer(Limit) ->
+    gen_server:start({local, Name}, ?MODULE, {Limit, MFA, Sup}, []).
+ 
+start_link(Name, Limit, Sup, MFA) when is_atom(Name), is_integer(Limit) ->
+    gen_server:start_link({local, Name}, ?MODULE, {Limit, MFA, Sup}, []).
+ 
+run(Name, Args) ->
+    gen_server:call(Name, {run, Args}).
+ 
+sync_queue(Name, Args) ->
+    gen_server:call(Name, {sync, Args}, infinity).
+ 
+async_queue(Name, Args) ->
+    gen_server:cast(Name, {async, Args}).
+ 
+stop(Name) ->
+    gen_server:call(Name, stop).
+```
+
+- `run/2` runs tasks and informs the client if it can't be started when the pool is full
+- `sync_queue/2` runs tasks in a blocking manner. The waiting time is set to `infinity`.
+- `async_queue/2` runs tasks in an async manner
+- For `start/4` and `start_link/4`, the `A` part of the `MFA` will be determined by the`Args` from the run/queue functions
+
+```erlang
+%% The friendly supervisor is started dynamically!
+-define(SPEC(MFA),
+        {worker_sup,
+         {ppool_worker_sup, start_link, [MFA]},
+         temporary,
+         10000,
+         supervisor,
+         [ppool_worker_sup]}).
+
+-record(state, {limit = 0, sup, refs, queue = queue:new()}).
+
+init({Limit, MFA, Sup}) ->
+    {ok, Pid} = supervisor:start_child(Sup, ?SPEC(MFA)),
+    link(Pid),
+    {ok, #state{limit = Limit, refs = gb_sets:empty()}}.
+
+handle_info({start_worker_supervisor, Sup, MFA}, S = #state{}) ->
+    {ok, Pid} = supervisor:start_child(Sup, ?SPEC(MFA)),
+    link(Pid),
+    {noreply, S#state{sup = Pid}};
+handle_info(Msg, State) ->
+    io:format("Unknown msg: ~p~n", [Msg]),
+    {noreply, State}.
+```
+
+- We start the `worker_sup` from within the server. The child spec of `worker_sup` is defined in a macro.
+- The inner state of the server tracks the number of processes than can be running, the PID of the supervisor and a queue for all the jobs. To know when a worker's done running and to fetch one from the queue to start it, we will need to track each worker from the server (and thus we need a `refs` field to keep monitor references in memory).
+- Note that `init` shouldn't call `supervisor:start_child`, because the supervisor won't be able to process anything before `init` returns (thus a deadlock would occur). Instead, the server sends a message to itself that it processes later with `handle_info`
+- The first clause of `handle_info` calls the `ppool_sup` to add `worker_sup` and track its PID.
+
+```erlang
+handle_call({run, Args},
+            _From,
+            S = #state{limit = N,
+                       sup = Sup,
+                       refs = R})
+    when N > 0 ->
+    {ok, Pid} = supervisor:start_child(Sup, Args),
+    Ref = erlang:monitor(process, Pid),
+    {reply, {ok, Pid}, S#state{limit = N - 1, refs = gb_sets:add(Ref, R)}};
+handle_call({run, _Args}, _From, S = #state{limit = N}) when N =< 0 ->
+    {reply, noalloc, S};
+handle_call({sync, Args},
+            _From,
+            S = #state{limit = N,
+                       sup = Sup,
+                       refs = R})
+    when N > 0 ->
+    {ok, Pid} = supervisor:start_child(Sup, Args),
+    Ref = erlang:monitor(process, Pid),
+    {reply, {ok, Pid}, S#state{limit = N - 1, refs = gb_sets:add(Ref, R)}};
+handle_call({sync, Args}, From, S = #state{queue = Q}) ->
+    {noreply, S#state{queue = queue:in({From, Args}, Q)}};
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
+handle_call(_Msg, _From, State) ->
+    {noreply, State}.
+```
+
+- `run/2` is handled synchronously with the message of the form `{run, Args}`. When there are places `N` left in the pool, we start the worker. A monitor is then set up and stored in the state, and the counter is decremented. When there's no space, `noalloc` is replied.
+- `sync_queue/2` is handled similarly as `run/2` when there's space. When no workers can run, the server instead doesn't reply to the caller, but keeps the `From` information and enqueues it later for when a worker is free.
+- Unknown cases and `stop/1` are also handled.
+
+```erlang
+handle_cast({async, Args},
+            S = #state{limit = N,
+                       sup = Sup,
+                       refs = R})
+    when N > 0 ->
+    {ok, Pid} = supervisor:start_child(Sup, Args),
+    Ref = erlang:monitor(process, Pid),
+    {noreply, S#state{limit = N - 1, refs = gb_sets:add(Ref, R)}};
+handle_cast({async, Args}, S = #state{limit = N, queue = Q}) when N =< 0 ->
+    {noreply, S#state{queue = queue:in(Args, Q)}};
+%% Not going to explain this one!
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+```
+
+- When there's no place left for a worker, there's no `From` information and just send it to the queue without it.
+
+```erlang
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+handle_info({'DOWN', Ref, process, _Pid, _}, S = #state{refs = Refs}) ->
+    io:format("received down msg~n"),
+    case gb_sets:is_element(Ref, Refs) of
+        true ->
+            handle_down_worker(Ref, S);
+        false -> %% Not our responsibility
+            {noreply, S}
+    end;
+...
+
+handle_down_worker(Ref,
+                   S = #state{limit = L,
+                              sup = Sup,
+                              refs = Refs}) ->
+    case queue:out(S#state.queue) of
+        {{value, {From, Args}}, Q} ->
+            {ok, Pid} = supervisor:start_child(Sup, Args),
+            NewRef = erlang:monitor(process, Pid),
+            NewRefs = gb_sets:insert(NewRef, gb_sets:delete(Ref, Refs)),
+            gen_server:reply(From, {ok, Pid}),
+            {noreply, S#state{refs = NewRefs, queue = Q}};
+        {{value, Args}, Q} ->
+            {ok, Pid} = supervisor:start_child(Sup, Args),
+            NewRef = erlang:monitor(process, Pid),
+            NewRefs = gb_sets:insert(NewRef, gb_sets:delete(Ref, Refs)),
+            {noreply, S#state{refs = NewRefs, queue = Q}};
+        {empty, _} ->
+            {noreply, S#state{limit = L + 1, refs = gb_sets:delete(Ref, Refs)}}
+    end.
+```
+
+- Whenever a worker goes down, we use the notification to dequeue a task with `handle_down_worker`. The function pops the next task to run from the queue.
+    - If there is at least one element in the queue, it will be in the form `{{value, Item}, NewQueue}`.
+        - If `Item` is `{From, Args}`, we know it came from `sync_queue/2`
+        - Else it comes from `async_queue/2`.
+    - Both cases where the queue has tasks in it will behave roughly the same - a new worker is attached to the worker supervisor, the reference of the old worker's monitor is removed and replaced with the new worker's monitor reference. In the synchronous call, a manual reply is sent.
+    - If the queue is empty, it returns `{empty, SameQueue}`.
+
+As the functions are scattered around the place, an API module `ppool` abstracts all the calls away.
+
+```erlang
+%%% API module for the pool
+-module(ppool).
+
+-export([start_link/0, stop/0, start_pool/3, run/2, sync_queue/2, async_queue/2,
+         stop_pool/1]).
+
+start_link() ->
+    ppool_supersup:start_link().
+
+stop() ->
+    ppool_supersup:stop().
+
+start_pool(Name, Limit, {M, F, A}) ->
+    ppool_supersup:start_pool(Name, Limit, {M, F, A}).
+
+stop_pool(Name) ->
+    ppool_supersup:stop_pool(Name).
+
+run(Name, Args) ->
+    ppool_serv:run(Name, Args).
+
+async_queue(Name, Args) ->
+    ppool_serv:async_queue(Name, Args).
+
+sync_queue(Name, Args) ->
+    ppool_serv:sync_queue(Name, Args).
+```
+
+Note that the process pool doesn't limit the number of items that can be stored in the queue. In a real server application, you'll typically need to put a ceiling on how many things can be queued to avoid crashing when too much memory is used (unless there's a fixed number of callers which block on `sync_queue/2`.
+
+Synchronous calls are a good way to control the load on the system. When the system is swamped by producers faster than consumers, synchronous calls block incoming queries.
+
+## Writing a Worker
+
+In this section, an example worker that sends repeated messages until a given deadline will be written. It'll be able to take:
+
+- a time delay for which to nag
+- an address (PID) to say where the messages should be sent
+- a nagging message to be sent in the process mailbox, including the nagger's own PID to be able to call a stop function to say the task is done
+
+A `gen_server` is used, although the pool is able to accept any OTP client process.
+
+People use `gen_server` all the time, sometimes even when it's not appropriate.
+
+```erlang
+%% demo module, a nagger for tasks,
+%% because the previous one wasn't good enough
+-module(ppool_nagger).
+
+-behaviour(gen_server).
+
+-export([start_link/4, stop/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3,
+         terminate/2]).
+
+start_link(Task, Delay, Max, SendTo) ->
+    gen_server:start_link(?MODULE, {Task, Delay, Max, SendTo}, []).
+
+stop(Pid) ->
+    gen_server:call(Pid, stop).
+
+init({Task, Delay, Max, SendTo}) ->
+    {ok, {Task, Delay, Max, SendTo}, Delay}.
+```
+
+- In `init`, `Task` is the message, `Delay` is the time between each sending, `Max` is the number of times it's going to be sent and `SendTo` is a PID or a name where the message will go. As `Delay` is passed as a third element of the tuple. which means that `timeout` will be sent to `handle_info` after `Delay` milliseconds.
+- The `handle_info` callback will send nags when it receives `timeout`, unless it has reached the `Max` number of messages sent.
+
+## Running the Pool
+
+After compiling the files, we can test the process pool.
+
+```erlang
+1> ppool:start_link().
+{ok,<0.33.0>}
+2> ppool:start_pool(nagger, 2, {ppool_nagger, start_link, []}).
+{ok,<0.35.0>}
+3> ppool:run(nagger, ["finish the chapter!", 10000, 10, self()]).
+{ok,<0.39.0>}
+4> ppool:run(nagger, ["Watch a good movie", 10000, 10, self()]).
+{ok,<0.41.0>}
+5> flush().
+Shell got {<0.39.0>,"finish the chapter!"}
+Shell got {<0.39.0>,"finish the chapter!"}
+ok
+6> ppool:run(nagger, ["clean up a bit", 10000, 10, self()]).
+noalloc
+7> flush().
+Shell got {<0.41.0>,"Watch a good movie"}
+Shell got {<0.39.0>,"finish the chapter!"}
+Shell got {<0.41.0>,"Watch a good movie"}
+Shell got {<0.39.0>,"finish the chapter!"}
+Shell got {<0.41.0>,"Watch a good movie"}
+...
+```
+
+In the above, a pool is started, tasks are added and messages are sent to the right destination. When more tasks than allowed are run, allocation is denied.
+
+```erlang
+8> ppool:async_queue(nagger, ["Pay the bills", 30000, 1, self()]).
+ok
+9> ppool:async_queue(nagger, ["Take a shower", 30000, 1, self()]).
+ok
+10> ppool:async_queue(nagger, ["Plant a tree", 30000, 1, self()]).
+ok
+<wait a bit>
+received down msg
+received down msg
+11> flush().
+Shell got {<0.70.0>,"Pay the bills"}
+Shell got {<0.72.0>,"Take a shower"}
+<wait some more>
+received down msg
+12> flush().
+Shell got {<0.74.0>,"Plant a tree"}
+ok
+```
+
+In the above, the first two naggers run as soon as possible. Then, the worker limit is hit and we need to queue the third one.
+
+```erlang
+13> ppool:sync_queue(nagger, ["Pet a dog", 20000, 1, self()]).
+{ok,<0.108.0>}
+14> ppool:sync_queue(nagger, ["Make some noise", 20000, 1, self()]).
+{ok,<0.110.0>}
+15> ppool:sync_queue(nagger, ["Chase a tornado", 20000, 1, self()]).
+received down msg
+{ok,<0.112.0>}
+received down msg
+16> flush().
+Shell got {<0.108.0>,"Pet a dog"}
+Shell got {<0.110.0>,"Make some noise"}
+ok
+received down msg
+17> flush().
+Shell got {<0.112.0>,"Chase a tornado"}
+ok
+```
+
+The basic sequence of events is that two workers are added to the pool. When the third task is queued, the first two are not yet done running and the shell gets locked up until `ppool_serv` receives a worker's down message. Following that, `sync_queue/2` can then return.
+
+```erlang
+18> ppool:stop_pool(nagger).
+ok
+19> ppool:stop().
+** exception exit: killed
+```
+
+All pools will be terminated if you decide to just call `ppool:stop()` directly, but there will be a series of error messages as `ppool_supersup` is brutally killed.
+
+## Cleaning the Pool
+
+The application written can
+
+- Perform simple resource allocation
+- Handle everything in parallel
+- Restart pieces of the application that crash
+
+As failure isolation and concurrency is handled, we have the architectural blocks to write solid server-side software.
+
+The next chapter will package the `ppool` application into a real OTP application, ready to be shipped and use by other products.
+
+# Building OTP Applications
+
+Instead of writing a script to start the trees and subtrees, OTP provides an established, consistent and generalized way of starting applications. They give:
+
+- a directory structure
+- a way to handle configurations
+- dependencies
+- environment variables
+- ways to start and stop applications
+- safe control in detecting conflicts
+- handling live upgrades without shutting down the application
+
+## The Application Resource File
+
+An application file will tell the Erlang VM what the application is, where it begins and where it ends.
+
+This file lives in the `ebin/` directory along with the compiled modules.
+
+The file is usually named `<yourapp>.app` (in this case `ppool.app`) and contains Erlang terms defining the application in terms the VM understands.
+
+Some prefer to keep the application resource file outside of `ebin/` and instead have a file named `<myapp>.app.src` as part of `src/`. The build system then copies this file over to `ebin/` or even generates an `app` file to keep everything clean.
+
+`{application, ApplicationName, Properties}`
+
+- `ApplicationName` is an atom
+- `Properties` is a list of `{Key, Value}` tuples describing the application, used by OTP to figure out what your application does. They are all optional but might be necessary for some tools.
+
+    `{description, "Some description of the application"}`
+
+    - Gives the system a short description of what the application is. Optional and defaults to an empty string.
+
+    `{vsn, "1.2.3"}`
+
+    - Tells the version of the application. The string takes any format you want, although it's a good idea to stick to semantic versioning. The tools that help with upgrades and downgrades use this string to identify the application's version.
+
+    `{modules, ModuleList}`
+
+    - Contains a list of modules that the application introduces to the system. A module always belongs to at most one application and cannot be in two applications' app files at once. The list lets the system and tools look at dependencies and make sure there are no conflicts with other applications already loaded in the system.
+
+    `{registered, AtomList}`
+
+    - List of names registered by the application. This lets OTP know when there will be name clashes when you try to bundle a bunch of applications together, but is entirely based on trusting the developers to give good data.
+
+    `{env, [{Key, Value}]}`
+
+    - List of key/values that serve as config for your application. They can be obtained at run time by calling `application:get_env(Key)` or `application:get_env(AppName, Key)`. The first one will try to find the value in the application file or whatever application you are in at the moment of the call, the second allows the specification of an application in particular. Key/values can be overwritten at boot time or dynamically with `application:set_env/3-4`.
+
+    `{maxT, Milliseconds}`
+
+    - Maximum time that the application can run, after which it will be shut down. THis is rarely used and `Milliseconds` defaults to `infinity`.
+
+    `{applications, AtomList}`
+
+    - List of applications on which this one depends. The application system will make sure they were loaded and/or started before allowing yours to do so. All applications depend at least on `kernel` and `stdlib`, although they don't have to be added because the Erlang VM starts these applications automatically.
+
+    The standard library and VMs kernel are OTP applications themselves, which means that Erlang is a language used to build OTP, but whose runtime environments depends on OTP to work. This circular dependencies is why the language is officially named 'Erlang/OTP'.
+
+    `{mod, {CallbackMod, Args}}`
+
+    - Defines a callback module for the application using the application behaviour. This tells OTP that when starting your application, it should call `CallbackMod:start(normal, Args)`. This function's return value will be used when OTP will call `CallbackMod:stop(StartReturn)` when stopping the application. `CallbackMod` is usually named after the application.
+
+## Converting the Pool
+
+In this chapter, `ppool` from the previous chapter will be converted into a real OTP application.
+
+```erlang
+ebin/
+include/
+priv/
+src/
+ - ppool.erl
+ - ppool_sup.erl
+ - ppool_supersup.erl
+ - ppool_worker_sup.erl
+ - ppool_serv.erl
+test/
+ - ppool_tests.erl
+ - ppool_nagger.erl
+```
+
+As mentioned earlier, the four basic directories to have are `ebin/`, `include/`, `priv/` and `src/` and they'll be common to pretty much every OTP application. Only `ebin/` and `priv/` will be exported when OTP systems are deployed. `test/` and other directories like `doc/` are added when needed.
+
+Note that `ppool_nagger` belongs in the test directory - it was not much more than a demo case and has nothing to do with the application, but is still necessary for the tests.
+
+We'll also add an `Emakefile` placed in the app's base directory to help compile and run things.
+
+```erlang
+{"src/*", [debug_info, {i,"include/"}, {outdir, "ebin/"}]}.
+{"test/*", [debug_info, {i,"include/"}, {outdir, "ebin/"}]}.
+```
+
+The above tells the compiler to include `debug_info` for all files in `src/` and `test/`, tells it to look in the `include/` directory and place the output in `ebin/`.
+
+```erlang
+{application, ppool,
+  [{vsn, "1.0.0"},
+    {modules, [ppool, ppool_serv, ppool_sup, ppool_supersup, ppool_worker_sup]},
+    {registered, [ppool]},
+    {mod, {ppool, []}}
+]}.
+```
+
+`env`, `maxT` and `applications` are not used in the app file.
+
+## The Application Behaviour
+
+In OTP, design patterns as a convention is not sufficient, we want a solid abstraction, a pre-built implementation for them. The idea is for your application to give up its own execution flow and instead insert itself as a bunch of callbacks to be used by generic code.
+
+Whenever the VM first starts up a process called the application controller is started (with the name `application_controller`). It starts all other applications and sits on top of most of them (like some sort of supervisor for all applications).
+
+Note that the kernel application starts a process named `user` which sits over the application controller. The `user` process in fact acts as a group leader to the application controller and thus the kernel application needs some special treatment.
+
+In Erlang, the IO system depends on a concept called a group leader. The group leader represents standard input and output and is inherited by all processes. There is a hidden IO protocol that the group leader and any process calling IO functions communicate with. The group leader is responsible for forwarding these messages to whatever input/output channels there are.
+
+To start an application, the application controller (AC) starts an *application master* for the target application*.*
+
+**application master** two processes taking charge of each individual application: they set it up and act like a middleman in between the application's top supervisor and the application controller. It looks over the app and its children, and terminates it when things go wrong.
+
+Up to this point, we have been looking at the generic part of the behaviour. The application module requires very few functions to be function: `start/2` and `stop/1`.
+
+`YourMod:start(Type, Args)`
+
+- `Type` will always be `normal`. The other options have to do with distributed applications.
+- `Args` is what is coming from your app file
+- The function initialises everything for your app and only needs to return the PID of the application's top-level supervisor in one of the following forms: `{ok, Pid}` or `{ok, Pid, SomeState}`
+
+`YourMod:stop(StartReturn)`
+
+- `StartReturn` is the state returned by `start/2`
+- The function runs after the application is done running and only does the necessary cleanup.
+
+There are a few more functions that you can optionally use to have more control over the application, but they are not necessary for `ppool` now.
+
+## From Chaos to Application
+
+We need to modify `ppool.erl` to implement the two callbacks in the manner described above.
+
+```erlang
+-behaviour(application).
+
+-export([start/2, stop/1, start_pool/3, run/2, sync_queue/2, async_queue/2, stop_pool/1]).
+
+start(normal, _Args) ->
+    ppool_supersup:start_link().
+
+stop(_State) ->
+    ok.
+
+% start_link() ->
+%     ppool_supersup:start_link().
+
+% stop() ->
+%     ppool_supersup:stop().-
+```
+
+`stop/0` should also be removed from `ppool_supersup.erl` because OTP application tools will take care of that (using the registered application name).
+
+```erlang
+$ erl -make
+...
+$ erl -pa ebin/
+...
+1> application:start(ppool).
+ok
+2> ppool:start_pool(nag, 2, {ppool_nagger, start_link, []}).
+{ok,<0.142.0>}
+3> ppool:run(nag, [make_ref(), 500, 10, self()]).
+{ok,<0.146.0>}
+4> ppool:run(nag, [make_ref(), 500, 10, self()]).
+{ok,<0.148.0>}
+5> ppool:run(nag, [make_ref(), 500, 10, self()]).
+noalloc
+6> flush().
+Shell got {<0.146.0>,#Ref<0.0.0.625>}
+Shell got {<0.148.0>,#Ref<0.0.0.632>}
+...
+received down msg
+received down msg
+7> application:which_applications().
+[{ppool,[],"1.0.0"},
+ {stdlib,"ERTS  CXC 138 10","1.17.4"},
+ {kernel,"ERTS  CXC 138 10","2.14.4"}]
+8> application:stop(ppool).
+=SUPERVISOR REPORT==== 6-Jul-2021::15:48:13.396827 ===
+    supervisor: {<0.125.0>,ppool_sup}
+    errorContext: shutdown_error
+    reason: noproc
+    offender: [{pid,<0.126.0>},
+               {id,serv},
+               {mfargs,{ppool_serv,start_link,
+                                   [nag,2,<0.125.0>,
+                                    {ppool_nagger,start_link,[]}]}},
+               {restart_type,permanent},
+               {significant,false},
+               {shutdown,5000},
+               {child_type,worker}] 
+
+=INFO REPORT==== 6-Jul-2021::14:30:32.020009 ===
+    application: ppool
+    exited: stopped
+    type: temporary
+ok
+```
+
+- `application:start(ppool)` tells the application controller to launch the ppool application. It starts the `ppool_supersup` supervisor and from that point on, everything can be used as normal.
+- `application:which_applications()` shows all applications currently running.
+- `application:stop(ppool)` closes the pool.
+
+Why do the eunit tests and application:stop produce a supervisor report with a `noproc` shutdown error? Doesn't look like it's supposed to happen.
+
+Some people prefer starting their application on their own (i.e. `MyApp:start(...)`) instead of using `application:start(MyApp)`. While this works for testing purposes, it removes the advantages of having an application - the app is no longer part of the VM's supervision tree, cannot access it's environment variables, will not check dependencies before being started.
+
+Giving different arguments to `application:start` will allow it to behave differently:
+
+- `application:start(AppName, temporary)`
+
+    Ends normally: Nothing special happens, application has stopped.
+
+    Ends abnormally: The error is reported, and the application terminates without restarting.
+
+- `application:start(AppName, transient)`
+
+    Ends normally: Nothing special happens, the application has stopped.
+
+    Ends abnormally: The error is reported, all the other applications are stopped and the VM shuts down.
+
+- `application:start(AppName, permanent)`
+
+    Ends normally: All other applications are terminated and the VM shuts down.
+
+    Ends abnormally: Same; all applications are terminated, the VM shuts down.
+
+At the application level, the VM will no longer try to save your application by restarting it. Something has to go very wrong for the whole supervision tree of the application to die, and the VM loses hope when it happens instead of expecting a different outcome to happen if it were to try again.
+
+Note that all applications can be terminated with `application:stop(AppName)` without affecting others in the manner of a crash.
+
+## Library Applications
+
+Sometimes, we want to wrap flat modules in an application but have no process to start. 
+
+We omit the application callback module and remove the tuple `{mod, {Module, Args}}` from the application file to create a *library application*. The Erlang `stdlib` is an example of one.
+
+# The Count of Applications
+
+In this chapter, we write a second application that will depend on `ppool`, with more automation than the nagger worker.
+
+The application, named `erlcount` will have a simple objective: recursively look into some directory, find all `.erl` files and run a regular expression over them to count all instances of a given string within the modules. The results are then accumulated to give the final result and output to the screen.
+
+The specific application will be relatively simple, relying heavily on the process pool.
+
+![images/Untitled%2022.png](images/Untitled%2022.png)
+
+Application structure
+
+In the above:
+
+- `ppool` represents the whole application, but only as a means to show that `erlcount_counter` will be a worker in the process pool. The worker will open files, run the regular expression and return the count.
+- `erlcount_sup` will be the supervisor.
+- `erlcount_dispatch` will be a single server in charge of browsing the directories, asking `ppool` to schedule workers and compiling the results.
+- An `erlcount_lib` module will take charge of hosting all the functions to read directories and compile data, leaving the other modules with the responsibility of coordinating the calls.
+- Lastly, there is an `erlcount` module to serve as the application callback module.
+
+```erlang
+ebin/
+ - erlcount.app
+include/
+priv/
+src/
+ - erlcount.erl
+ - erlcount_counter.erl
+ - erlcount_dispatch.erl
+ - erlcount_lib.erl
+ - erlcount_sup.erl
+test/
+Emakefile
+```
+
+```erlang
+{application, erlcount,
+  [{vsn, "1.0.0"},
+  {modules, [erlcount, erlcount_sup, erlcount_lib,
+            erlcount_dispatch, erlcount_counter]},
+  {applications, [ppool]},
+  {registered, [erlcount]},
+  {mod, {erlcount, []}},
+  {env,
+    [{directory, "."},
+      {regex, ["if\\s.+->", "case\\s.+\\sof"]},
+      {max_files, 10}]}
+  ]}.
+```
+
+- LIke the ppool app file, the version number, modules and registered processes are reported.
+
+    *Technically none of our modules started as part of the erlcount app will need a name. Everything we do can be anonymous. However, because we know ppool registers the ppool_serv to the name we give it and because we know we will use a process pool, then we're going to call it erlcount and note it there. If all applications that use ppool do the same, we should be able to detect conflicts in the future. The mod tuple is similar as before; we define the application behaviour callback module there.*
+
+    Erm... wouldn't the app name need to be registered anyway? Isn't that how we refer to the application ala `application:stop(erlcount)`?
+
+- This application has a dependency. As explained earlier, the `applications` tuple gives a list of all the applications that should be started before `erlcount`.
+- The `env` tuple's variables are accessible from all the processes running within the application. The variables are stored in memory and can basically be used as a substitute configuration file. We define:
+    - `directory`, which tells the app where to look
+    - `max_files` which tells us how many file descriptors should be opened as once (should match the number of workers in ppool)
+    - `regex`, which contains a list of regular expressions we want to count matches of
+
+`"if\\s.+->"`
+
+- "Look for a string that contains 'if' followed by any single white space character, followed by anything up until `->`. "
+- Broadly corresponds to the count of `if ... end` expressions.
+
+`"case\\s.+\\sof"` 
+
+- "Look for a string that contains 'case' followed by a single whitespace character, followed by anything up until 'of'".
+- Broadly corresponds to the count of `case ... of` expressions.
+
+The proper way to do static code analysis would be on the parsed version of the code - this would make sure that everything like macros, comments and strings are handled the right way.
+
+```erlang
+-module(erlcount).
+-behaviour(application).
+
+-export([start/2, stop/1]).
+
+start(normal, _Args) ->
+    erlcount_sup:start_link().
+
+stop(_State) ->
+    ok.
+```
+
+The supervisor will only be in charge of `erlcount_dispatch`. `MaxRestart`, `MaxTime` and the 60 seconds for shutdown were chosen arbitrarily.
+
+Next, the dispatcher. It has a few complex requirements to fulfil:
+
+- Even if applying multiple regexes, the whole list of directories should only be traversed once.
+- Files should start being scheduled for result counting as soon as there's one that matches the criteria, instead of waiting for the complete list.
+- A counter should be held per regex.
+- Results will start coming infrom `erlcount_counter` workers before traversal of files are done.
+- Many `erlcount_counter` workers can be running at once.
+- Results might continue to come in after all files are visited (especially if there are many files or complex regexes).
+
+The first thing to consider is that we have to go through a directory recursively while still being able to get results from there (the file names) in order to schedule them, and then accept results back while that goes on.
+
+Using a process to return results while in the middle of recursion is inconvenient, as we would have to change the previous structure just to be able to add another process to the supervision tree (under `erlcount_sup`).
+
+Instead, we use a style of programming called *Continuation-Passing Style*. The basic idea behind is to take one function that's usually deeply recursive and break every step down. We return each step, which would usually be the accumulator, and then a function that will allow us to keep going after that.
+
+In this case, our function will have two return values:
+
+- `{continue, Name, NextFun}`
+- `done`
+
+Whenever the first one is received, we can schedule `FileName` into `ppool`, then call `NextFun` to keep looking for more files. This is implemented in a function in `erlcount_lib`:
+
+```erlang
+-module(erlcount_lib).
+
+-export([find_erl/1, regex_count/2]).
+
+-include_lib("kernel/include/file.hrl").
+
+%% Finds all files ending in .erl
+find_erl(Directory) ->
+    find_erl(Directory, queue:new()).
+
+%%% Private
+%% Dispatches based on file type
+find_erl(Name, Queue) ->
+    {ok, F = #file_info{}} = file:read_file_info(Name),
+    case F#file_info.type of
+        directory ->
+            handle_directory(Name, Queue);
+        regular ->
+            handle_regular_file(Name, Queue);
+        _Other ->
+            dequeue_and_run(Queue)
+    end.
+
+%% Opens directories and enqueues files in there
+handle_directory(Dir, Queue) ->
+    case file:list_dir(Dir) of
+        {ok, []} ->
+            dequeue_and_run(Queue);
+        {ok, Files} ->
+            dequeue_and_run(enqueue_many(Dir, Files, Queue))
+    end.
+
+%% Pops an item from the queue and runs it.
+dequeue_and_run(Queue) ->
+    case queue:out(Queue) of
+        {empty, _} ->
+            done;
+        {{value, File}, NewQueue} ->
+            find_erl(File, NewQueue)
+    end.
+
+%% Adds a bunch of items to the queue.
+enqueue_many(Path, Files, Queue) ->
+    F = fun(File, Q) ->
+           queue:in(
+               filename:join(Path, File), Q)
+        end,
+    lists:foldl(F, Queue, Files).
+
+%% Checks if the file finishes in .erl
+handle_regular_file(Name, Queue) ->
+    case filename:extension(Name) of
+        ".erl" ->
+            {continue, Name, fun() -> dequeue_and_run(Queue) end};
+        _NonErl ->
+            dequeue_and_run(Queue)
+    end.
+
+regex_count(Re, Str) ->
+    case re:run(Str, Re, [global]) of
+        nomatch ->
+            0;
+        {match, List} ->
+            length(List)
+    end.
+```
+
+In the above:
+
+- The `file` module is included. It contains a record (`#file_info{}`) with some fields explaining details about the file, including it's type, size, permissions and so on.
+- The design includes a queue. Each directory can contain more than one file. So when a directory is hit and it contains multiple files, we want to handle the first one (opening it if it's a folder) and then handle the rest. The file names are stored in memory until they can be processed.
+- `find_erl/2` only handles regular files and directory. In each case there will be a function to handle the specific occurrence. For other files, anything prepared before will be dequeued with the help of `dequeue_and_run/1`.
+- `handle_directory/2` keeps searching with `dequeue_and_run/1` if there are no files. If there are any, the files are enqueued.
+- `dequeue_and_run/1` will take the queue of file names and get one element out of it. The file name it fetches out from there will be used by calling `find_erl(Name, Queue)`, and the directory traversal proceeds. If the queue is empty (`{empty, _}`), the function considers itself `done` (CPS keyword).
+- `enqueue_many/3` is designed to enqueue all the files found in a given directory. `filename:join/2` is used to merge the path with the file name, and the full name is added to the queue.
+- `handle_regular_file/2` checks the extension and if the name matches, the continuation returns. The continuation gives `Name` to the caller, and then wraps the operation `dequeue_and_run/1` with the queue of files left to visit. If the file doesn't end in `.erl`, the function continues dequeuing more files.
+
+The CPS code is done, and the next step is designing the dispatcher so that it can both dispatch and receive at once. A FSM can be used. It will have two states:
+
+- The first one will be "dispatching", it's the one used whenever we are waiting for the `find_erl` CPS function to hit the done entry.
+- The second state is 'listening', which receives notices from ppool
+
+![images/Untitled%2023.png](images/Untitled%2023.png)
+
+Thus, we need:
+
+- A dispatching state with an asynchronous event for when there are new files to dispatch
+- A dispatching state with an asynchronous event for when we are done processing files
+- A listening state with an asynchronous event for when we're done processing files
+- A global event to be sent by the ppool workers when they're done running their regular expression
+
+```erlang
+-module(erlcount_dispatch).
+
+-behaviour(gen_fsm).
+
+-export([start_link/0, complete/4]).
+-export([init/1, dispatching/2, listening/2, handle_event/3, handle_sync_event/4,
+         handle_info/3, terminate/3, code_change/4]).
+
+-define(POOL, erlcount).
+
+-record(data, {regex=[], refs=[]}).
+
+%%% PUBLIC API
+start_link() ->
+    gen_fsm:start_link(?MODULE, [], []).
+
+complete(Pid, Regex, Ref, Count) ->
+    gen_fsm:send_all_state_event(Pid, {complete, Regex, Ref, Count}).
+
+init([]) ->
+    %% Move the get_env stuff to the supervisor's init.
+    {ok, Re} = application:get_env(regex),
+    {ok, Dir} = application:get_env(directory),
+    {ok, MaxFiles} = application:get_env(max_files),
+    ppool:start_pool(?POOL, MaxFiles, {erlcount_counter, start_link, []}),
+    case lists:all(fun valid_regex/1, Re) of
+        true ->
+            self() ! {start, Dir},
+            {ok, dispatching, #data{regex = [{R, 0} || R <- Re]}};
+        false ->
+            {stop, invalid_regex}
+    end.
+
+valid_regex(Re) ->
+    try re:run("", Re) of
+        _ ->
+            true
+    catch
+        error:badarg ->
+            false
+    end.
+
+handle_info({start, Dir}, State, Data) ->
+    gen_fsm:send_event(self(), erlcount_lib:find_erl(Dir)),
+    {next_state, State, Data}.
+
+dispatching({continue, File, Continuation}, Data = #data{regex = Re, refs = Refs}) ->
+    F = fun({Regex, _Count}, NewRefs) ->
+           Ref = make_ref(),
+           ppool:async_queue(?POOL, [self(), Ref, File, Regex]),
+           [Ref | NewRefs]
+        end,
+    NewRefs = lists:foldl(F, Refs, Re),
+    gen_fsm:send_event(self(), Continuation()),
+    {next_state, dispatching, Data#data{refs = NewRefs}};
+dispatching(done, Data) ->
+    %% This is a special case. We can not assume that all messages have NOT
+    %% been received by the time we hit 'done'. As such, we directly move to
+    %% listening/2 without waiting for an external event.
+    listening(done, Data).
+
+listening(done,
+          #data{regex = Re, refs = []}) -> % all received!
+    [io:format("Regex ~s has ~p results~n", [R, C]) || {R, C} <- Re],
+    {stop, normal, done};
+listening(done,
+          Data) -> % entries still missing
+    {next_state, listening, Data}.
+
+handle_event({complete, Regex, Ref, Count},
+             State,
+             Data = #data{regex = Re, refs = Refs}) ->
+    {Regex, OldCount} = lists:keyfind(Regex, 1, Re),
+    NewRe = lists:keyreplace(Regex, 1, Re, {Regex, OldCount + Count}),
+    NewData = Data#data{regex = NewRe, refs = Refs -- [Ref]},
+    case State of
+        dispatching ->
+            {next_state, dispatching, NewData};
+        listening ->
+            listening(done, NewData)
+    end.
+
+handle_sync_event(Event, _From, State, Data) ->
+    io:format("Unexpected event: ~p~n", [Event]),
+    {next_state, State, Data}.
+
+terminate(_Reason, _State, _Data) ->
+    ok.
+
+code_change(_OldVsn, State, Data, _Extra) ->
+    {ok, State, Data}.
+```
+
+- The gen_fsm will have two functions: one for the supervisor (`start_link/4`) and one for the ppool callers (`complete/4`).
+    - `complete/4` will only have to send 3 pieces of data: what regex they were running, what the assocaited score was, and the reference (explained below)
+- The other functions are the standard gen_fsm callbacks, including `listening/2` and `dispatching/2` asynchronous state handlers.
+- The `?POOL` macro is used to give the pool the name 'erlcount'.
+- Since our erlcount app is going to always call `ppool:async_queue/2`, there will be no real way of knowing if files are done processing or not.
+
+    Instead of using a timeout to guess if a worker is done, each worker is given some kind of identity, which is then tracked and associated with replies. The state data thus contains a list of refs in addition to a list of the regexes (`{RegularExpression, NumberOfOccurences}`).
+
+- `init/1` first loads all the info from the application file. The process pool is the started with `erlcount_counter` as the callback module. The last step makes sure that all the regexes are valid, handling any errors now rather than later. If valid, we send ourselves `{start, Directory}`.
+- `handle_info/3` handles the following messages:
+    - `{start, Dir}` is handled by sending ourselves the result of `find_erl`. The result will be received in `dispatching` given that we initialize the FSM in that state. Because `find_erl/1` is written in Continuation-Passing Style, we can just send ourselves an asynchronous event and deal with it in the right callback states.
+- `dispatching/2` handles:
+    - `{continue, File, Fun}` by iterating over regexes, creating a unique reference, scheduling a ppool worker that knows this reference, and then store this reference to know if a worker is done. Once that dispatching is done, we call the continuation again to get more file names and send the results to ourselves as state.
+    - `done` by moving to the listening state directly without waiting for an external event. If we had chosen to use an external event, the event might be received while the FSM is still in dispatching. When it moves to listening, there will be no external event incoming, leaving it hanging forever.
+- `listening/2` will do result detection to make sure everything has been received.
+    - If no refs are left, then everything was received and we can output the results.
+    - Otherwise, we can keep listening to messages. As the result messages are global, they can be received in either dispatching or listening states.
+- `handle_event/3` takes care of the global result message. The first thing this does is find the regex that just completed in the `Re` list. The extracted count is updated with the help of `lists:keyreplace/4`.  The `Data` record is updated with the new scores while removing the `Ref` of the worker. Once again, `listening/2` is called directly.
+
+## The Counter
+
+The counter is a gen_server that only needs to do three things:
+
+1. Open a file
+2. Run a regex and count the instances
+3. Give the result back.
+
+1 is done with the help of `file` module functions. 3 is done with `erlcount_dispatch:complete/4`. For number 2, we use `re` module (wrapped with a helper in `erlcount_lib`) with `run/2-3`.
+
+```erlang
+-module(erlcount_counter).
+
+-behaviour(gen_server).
+
+-export([start_link/4]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3]).
+
+-record(state, {dispatcher, ref, file, re}).
+
+start_link(DispatcherPid, Ref, FileName, Regex) ->
+    gen_server:start_link(?MODULE, [DispatcherPid, Ref, FileName, Regex], []).
+
+init([DispatcherPid, Ref, FileName, Regex]) ->
+    self() ! start,
+    {ok,
+     #state{dispatcher = DispatcherPid,
+            ref = Ref,
+            file = FileName,
+            re = Regex}}.
+
+handle_call(_Msg, _From, State) ->
+    {noreply, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(start, S = #state{re = Re, ref = Ref}) ->
+    {ok, Bin} = file:read_file(S#state.file),
+    Count = erlcount_lib:regex_count(Re, Bin),
+    erlcount_dispatch:complete(S#state.dispatcher, Re, Ref, Count),
+    {stop, normal, S}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+```
+
+- `init/1` sends a message to the gen_server itself to get it to start
+- `handle_info/2` handles the start message, opens the file (`file:read_file(Name)`), get the count and send it back with `complete/4`. Following which the worker is stopped.
+
+```erlang
+$ erl -make
+...
+```
+
+## Running the App
+
+There are many ways to get the app running. From the directory where the two apps are located (on the same level), start Erlang the following manner:
+
+```erlang
+$ erl -env ERL_LIBS "."
+```
+
+The `ERL_LIBS` variable is a special variable defined in your environment that lets you specify where Erlang can find OTP applications. The VM is then able to automatically look in there to find the `ebin/` directories. `erl` can also take an argument of the form `-env NameOfVar Value` to override this setting quickly. `ERL_LIBS` is especailly useful when installing libraries.
+
+```erlang
+1> application:load(ppool).
+ok
+2> application:start(ppool), application:start(erlcount).
+ok
+Regex if\s.+-> has 20 results
+Regex case\s.+\sof has 26 results
+```
+
+Apart from modifying the application file to change the variables, we can use the `erl` executable and the flag `-AppName Key1 Val1 Key2 Val2 ... KeyN ValN`.
+
+```erlang
+$ erl -env ERL_LIBS "." -erlcount regex '["State"]'
+...
+1> application:start(ppool), application:start(erlcount).
+ok
+Regex State has 122 results
+2> q().
+ok
+```
+
+Note that expressions are given in single quotation marks to have the shell take them literally. This differs from shell to shell.
+
+## Included Applications
+
+Included applications are one way to start applications automatically. The basic idea is to define an application (in this case `ppool`) as part of another one (`erlcount`). To achieve this, you modify your application file and add something called *start phases*.
+
+It is increasingly recommended not to use included applications as they seriously limit code reuse. If `ppool` is pushed into an included application, it can no longer be included in any other application on the VM. If `erlcount` dies, then `ppool` will be taken down with it, affecting any other applications that wanted to use `ppool`.
+
+Included applications are thus usually excluded from many Erlang programmer's toolbox. Instead, releases help us achieve the same outcome (and more) in a more generic manner.
+
+## Complex Terminations
+
+There are cases where more steps are needed before terminating the application. The `stop/1` function from the application callback module might not be enough, especially since it gets called after the application has already terminated.
+
+To clean things up before the application is actually gone, add a function `prep_stop(State)` to the application callback module. `State` will be the state returned by your `start/2` and whatever `prep_stop/1` returns will be passed to `stop/1`. 
+
+# Release is the Word
+
+OTP releases are part of a system made to help package applications with minimal resources and dependencies.
+
+## Fixing the Leaky Pipes
+
+The first problem to resolve is that once `erlcount` is done running, the VM stays up doing nothing. A command is added that will shut the BEAM virtual machine down in an orderly manner. The best place to do this is within `erlcount_dispatch.erl`'s own terminate function given that it's called after all results are obtained. 
+
+The perfect function to tear everything down is `init:stop/0`, which will take care of terminating our applications in order, get rid of file descriptors, sockets etc. The new stop function is as follows:
+
+```erlang
+ terminate(_Reason, _State, _Data) ->
+    init:stop().
+```
+
+More fields are also required to build releases. The following descriptions should be added to the app files:
+
+```erlang
+{description, "Run and enqueue different concurrent tasks"}
+```
+
+```erlang
+{description, "Run regular expressions on Erlang source files"}
+```
+
+`stdlib` and `kernel` should also be added to the applications tuple in the app files.
+
+```erlang
+{applications, [stdlib, kernel]}
+```
+
+```erlang
+{applications, [stdlib, kernel, ppool]}
+```
+
+While adding `stdlib` and `kernel` has  virtually no impact when releases are started manually, both libraries should still be added to the list. People who generaete releases with `reltool` will need these applications in order for their release to run well and shut the VM down properly.
+
+With termination in place and the updated app files, the last step before working with releases is to compile all the applications by running `erl -make` in each directory with an Emakefile.
+
+Erlang's tools won't perform this build step and omitting it will produce a release without code to run.
+
+## Releases with Systools
+
+The `systools` application is the simplest one to build Erlang releases. The components required for a successful minimal Erlang release are as follows:
+
+- An Erlang Run Time System (ERTS) of choice
+- `stdlib`
+- `kernel`
+- The ppool application
+- The erlcount application
+
+The above are encapsulated in a file (`erlcount-1.0.rel`) and placed at the top-level directory.
+
+```erlang
+{release,
+  {"erlcount", "1.0.0"},
+  {erts, "12.0.2"},
+  [{kernel, "8.0.1"},
+    {stdlib, "3.15.1"},
+    {ppool, "1.0.0", permanent},
+    {erlcount, "1.0.0", transient}]}.
+```
+
+- Note that we can specify how we want the applications to be started (`temporary`, `transient`, `permanent`).
+- To find out version numbers of `stdlib` and `kernel`, we can just use `application:which_applications()`.
+- The version number for the ERTS can be deduced by launching the shell.
+- Also note that the release shares a name with the application `erlcount`, although they are unrelated by the naming.
+
+`systools` is smart enough to look at the app files in a release and figure out what needs to run before what. 
+
+BEAM can start itself with a basic configuration taken from a *boot file*. When an application is started manually from the shell, it implicitly calls the ERTS with a default boot file.
+
+b**oot file** binary file created from something called a boot script, which contains tuples that represents basic instructions such as 'load the standard library', 'load the kernel application', 'run a given function' etc.
+
+The boot script is generated from the `.rel` file, using the following command:
+
+```erlang
+$ erl -env ERL_LIBS .
+...
+1> systools:make_script("erlcount-1.0", [local]).
+ok
+```
+
+The first command produces the files `erlcount-1.0.script` and `erlcount-1.0.boot` in the directory. The `local` option means that we want the release to be possible to run from anywhere and not just the current install.
+
+With the boot script, we can make a tar file to distribute the code. `systools` will look for the release files and the ERTS. If the `erts` option is omitted, the release won't be self-executable and will depend on the presence of Erlang already installed on a system.
+
+```erlang
+2> systools:make_tar("erlcount-1.0", [{erts, "/usr/lib/erlang/"}]).
+ok
+```
+
+Running the function call above will have created an archive file named `erlcount-1.0.tar.gz`. Unarchive the files and the following directory should be visible:
+
+```erlang
+erts-12.0.2/
+lib/
+releases/
+```
+
+- The erts directory will contain the run time system
+- The lib directory holds all the applications needed
+- The releases directory has the boot files
+
+Moving into the directory where the files are extracted, we can specify where to find the `erl` executable and the boot file (without the `.boot` extension).
+
+```erlang
+$ ./erts-12.0.2/bin/erl -boot releases/1.0.0/start
+```
+
+There's no guarantee that a release will work on any system. The issue is that ERTS shipped might not work - you will either need to create many binary packages for many different platforms for large-scale definition, or ship the BEAM files without the assocaited ERTS and have users run them with their own native Erlang system on their computer.
